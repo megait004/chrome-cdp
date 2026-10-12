@@ -35,27 +35,59 @@ Anything that happened before `connect()` is invisible. If you navigate first an
 
 This is the decision that determines whether the task takes 20 seconds or 5 minutes of confused reloading.
 
-Every `cli.js` command is a self-contained round trip: connect → goto → do one thing → **closePage** → disconnect. That is perfect for one question with one answer, and wrong for anything else, because the next command starts from a cold page with no login, no SPA route, and no recorded traffic.
+Every `cli.js` command attaches to the live tab, does its one thing, and **leaves the tab open** — only `close` (or you, by hand) closes one. A command navigates only when you pass it a URL; omit the URL and it reads the page as it currently is, with the login, the SPA route, and the WebSocket session the user has built up. That makes a sequence of CLI commands behave like one session: log in once, then read from it indefinitely.
 
-**Use the CLI** when a single page load answers the question:
+**Use the CLI** for anything that is a read or a bounded capture:
 
 ```bash
-node cli.js dump-forms https://target.com/login
-node cli.js traffic https://target.com --json
+node cli.js dump-forms https://target.com/login          # navigate + audit
+node cli.js traffic https://target.com --bodies --out .tmp/traffic.json
 node cli.js search-sources https://target.com "api_key"
+node cli.js traffic --wait 10 --bodies --out .tmp/live.json   # attach to the live tab,
+                                                              # record 10s while the user interacts
 ```
 
 Full command list: `node cli.js --help`.
 
-**Write a script** the moment the task needs a second look at the page. Three signals:
+Three flags that save a whole script:
 
-- *Chained lookups.* `deobfuscate`, `unpack`, `ast-search`, and `download-bundle` all take a `queryOrId` you only learn from `search-sources`. Doing that over the CLI reloads the page for every step; in a script it is one load.
-- *State matters.* Log in, click through, change an SPA route, then inspect. The CLI throws that state away between commands.
-- *Timing matters.* You need to interact and then read what the interaction produced.
+- `traffic --bodies --out .tmp/traffic.json` — with a URL: waits for network idle, captures HTTP requests **and WebSocket frames** (`--wait S` dwells longer for late frames), drains every response body into the artifact (marked `(...)` where Chrome keeps none), writes it to a file, prints only the path. The default first move against any new target: one command, everything on disk, nothing to write. Without a URL: attaches to the current tab and records while the user interacts — the way to read a WebSocket session without disturbing it. WebSocket caveat: sockets opened before the attach show with `url: ''` (handshake missed) — their frames still flow and are searchable; run `traffic <url>` instead when the handshake matters.
+- `eval [url] <expr>` — with a URL it navigates first; without one it evaluates on the current tab. Chain evals to poke at state built up by earlier commands — `eval "({href: location.href, links: document.links.length})"`.
+- `search-sources [url] <query> --re` — regex search from the CLI. A plain query is a case-insensitive substring, which is usually enough; use `--re` when you need alternation (`websocket|wss:`). Note a leading `/` in an argument gets path-mangled by Git Bash, so regex is a flag rather than a `/.../` literal.
 
-Before you open the page at all, write down every question you want answered — including the follow-ups you can already see coming, and the edge cases you would otherwise go back for. One session can answer all of them; each extra page load costs a full navigation, re-records traffic you already had, and invalidates the `scriptId`s you were holding. The expensive mistake is not writing a script that turns out too big, it is discovering question six after you closed the page.
+Because every command accepts the URL as optional, a chain needs at most one navigation: `traffic <url>` loads the page, then `dump-forms`, `search-sources <query>`, `eval <expr>` all read that same live tab. Every one of them accepts a **query** for `queryOrId`, so you never need to carry a `scriptId` across commands either.
 
-Note `cli.js eval` is the odd one out: it does **not** navigate, it evaluates against whatever tab is currently open. Since every other CLI command closes its page on exit, running `eval` after one of them hits a blank tab. Use it to poke at a page you opened yourself, otherwise put the expression in a script.
+**Write a script** only when the flow itself needs control flow — branching, loops, or event-driven waits that one command at a time cannot express:
+
+- *Event-driven waits.* You need `waitForEvent` on WebSocket frames while sending, or `setBreakpoint` + `evaluateOnCallFrame`.
+- *Bulk processing.* Filtering, aggregating, or diffing large captures in one pass.
+- *Non-interactive environments.* When nobody is at the browser to close dialogs.
+
+Everything else — including page interaction — is CLI now. Long interaction scripts are how agents end up debugging their own code instead of looking at the page: the script assumed a DOM that was never there, failed, and the failure got attributed to the code rather than the assumption. Do it the human way instead:
+
+Before you open the page at all, write down every question you want answered — including the follow-ups you can already see coming, and the edge cases you would otherwise go back for. One session can answer all of them; each extra navigation re-records traffic you already had and invalidates the `scriptId`s you were holding. The expensive mistake is not writing a script that turns out too big, it is discovering question six after you closed the page.
+
+### Act like a human — the interaction loop
+
+A person looks, acts, and sees the result immediately. The CLI's interaction commands are built for exactly that loop, one step per command, each with the DOM delta in its output:
+
+```bash
+node cli.js snapshot https://target.com/login        # LOOK: interactive elements, visible ones only
+node cli.js type "#login_field" "user@example.com"   # ACT: keystrokes, real per-key events
+node cli.js fill "#password" "hunter2"               # ACT: set value via native setter (React-safe), fires input+change
+node cli.js click "text=Sign in"                     # ACT: match by visible text
+node cli.js wait "#dashboard" --timeout 10           # LOOK: did the expected thing appear?
+```
+
+Three properties that keep this loop honest:
+
+- **Every action returns what changed** — `urlChanged` (full navigation), `added`/`removedCount` (SPA mutations), `readyState`. The click's output IS the observation; you never have to guess whether anything happened.
+- **Every failure points back at the DOM.** A failed `click` lists the interactive elements that exist right now — the fix is to pick a real selector from that list, not to debug the command. An element that was there five commands ago is irrelevant; only the current DOM counts.
+- **`snapshot` before acting, always.** Pick selectors from what the page shows now — never from a previous snapshot, never from memory of a similar site. `text=Label` matches by visible text like a person reads a button, and `click [url] <target>` navigates first when a URL is given.
+- **Ambiguous text matches hit the wrong twin.** A page with several "Connect" buttons connects whichever the DOM puts first. Scope it: find the input, walk up to its panel (`eval` is fine for this), and click within that scope — or verify the action landed with an `eval` reading the app's own state (e.g. its connection log), not just the DOM's presence.
+- **You are on a real desktop — the revive steals focus.** When the Chrome window is occluded (`visibilityState: 'hidden'`), Chromium drops synthesized keyboard input entirely; `type`/`press` revive the window (minimized→normal dance) and it takes foreground focus. `type` verifies itself and falls back to `Input.insertText` when the keys did not land, and `type`/`fill` echo `valueAfter` with `valueMismatch: true` when the field does not hold what was typed — human keystrokes can land beside yours. On mismatch: don't retry blind; clear the field (`fill <sel> ""`) and retype, and tell the user you took their focus.
+
+This replaces the long interaction script for the common case: act one step at a time, re-read the DOM between steps, and let each step's own output tell you what to do next.
 
 ### Running a script
 
@@ -81,7 +113,7 @@ const { connect } = require('../index');
 node .tmp/probe.js
 ```
 
-Always `closePage()` + `disconnect()` in a `finally`. A leaked connection keeps the tab alive and the next run inherits a dirty page.
+Always `disconnect()` in a `finally`. Add `closePage()` too when the script is a throwaway probe — otherwise leave the tab open so the user can keep interacting with it; the next run attaches to the same live page and inherits its state (logins, SPA routes, WebSocket sessions). Clean up with `closePage()` or `node cli.js close` only when the tab is done serving.
 
 ---
 
@@ -104,6 +136,7 @@ node cli.js start        # or: npm start
 | `ECONNREFUSED 127.0.0.1:9222` | Chrome died, or something else owns the port | `node cli.js start`, or pass `--port` / `{ port }` to use another |
 | Page opens `chrome://newtab` and reads as empty | `connect()` reuses tab 0 and resets `chrome://` URLs to `about:blank` | Expected — just `goto()` your target |
 | Hangs ~30s then `ProtocolError` | A CDP call exceeded the 30s protocol timeout | `connect({ protocolTimeout: 120000 })` for heavy work like `unpackBundle` on a big bundle |
+| `Page.captureScreenshot timed out` (raw CDP) | The Chrome window is **minimized** — compositing is suspended, so no frame is ever produced. Navigation, screencast and `Page.setWebLifecycleState` do not revive it | `Browser.setWindowBounds({ windowId, bounds: { windowState: 'normal' } })` — or restore the window by hand. The CLI no longer screenshots at all: agents read DOM (`snapshot`), not images |
 
 ---
 
@@ -176,11 +209,16 @@ For WebSockets specifically, frames arrive *after* the handshake and often only 
 
 ---
 
-## Reading too late: response bodies expire
+## Reading too late: response bodies used to expire
 
-The timing trap has a mirror image. Everything this library records — URLs, headers, status, timings, WebSocket frames — lives in its own memory and survives the whole session. **Response bodies do not.** They stay in Chrome's network buffer, which Chrome evicts under memory pressure and clears on navigation. `getResponseBody()` reaches into that buffer, so it fails for anything Chrome has already thrown away.
+The timing trap has a mirror image. Everything this library records — URLs, headers, status, timings, WebSocket frames — lives in its own memory and survives the whole session. Response bodies are different: they stay in Chrome's network buffer, which Chrome evicts under memory pressure and clears on navigation.
 
-So drain bodies as you capture them, not at the end:
+**Since this build, `startRecording()` also calls `Network.configureDurableMessages`** — bodies are stored outside the renderer (100 MB total, 5 MB per resource), so `getResponseBody()` keeps working across navigations. Measured on Chrome 154: an XHR body fetched after two cross-site navigations still returns its full 7.6 KB. Two caveats an honest report must carry:
+
+- It is bounded, not infinite — past the buffer the oldest bodies go first, so a session that streams gigabytes can still lose early ones.
+- On older Chrome builds the call is rejected and silently ignored — bodies there behave the old way. When a body comes back empty, say so in that row rather than leaving a `null` for a reader to misread as an empty response.
+
+Drain bodies as you capture them anyway — it is cheap insurance and it is the only way to be sure a row's `body` was never truncated:
 
 ```javascript
 const captured = [];
@@ -190,7 +228,7 @@ for (const request of await waitUntil(() => client.network.getTraffic({ resource
 }
 ```
 
-The failure is quiet and it lands late. You scroll a page twenty times, collect thirty requests, then loop over them at the end and find the first few have bodies and the rest return an error string — by which time the page state that produced them is gone. Pull each body while its request is fresh, and if one comes back empty, say so in that row rather than leaving a `null` for a reader to misread as an empty response.
+The failure is quiet and it lands late. You scroll a page twenty times, collect thirty requests, then loop over them at the end and find the first few have bodies and the rest return an error string — by which time the page state that produced them is gone. Pull each body while its request is fresh.
 
 Two related habits worth the same discipline:
 
@@ -209,8 +247,14 @@ const posts = client.network.getTraffic({ method: 'POST' });
 console.log(await client.network.toRawRequest(posts[0].id));
 console.log(await client.network.toRawResponse(posts[0].id));
 
+// Or skip Burp entirely — replay the XHR identical to the original,
+// in-page; the replay is recorded like any other request.
+await client.network.replayXHR(posts[0].id);
+
 // Where does this token appear? URL, headers, and bodies all at once.
 client.network.searchTraffic(/bearer|auth_token|signature/i);
+// Response bodies specifically (native search, durable-store fallback):
+await client.network.searchBodies('api_key=');
 ```
 
 ### Inspect a WebSocket protocol
@@ -283,8 +327,8 @@ Breakpoints are how you catch a value that only exists for one tick — a signat
 
 ### Extract content
 ```javascript
-const article = await client.toMarkdown();   // Readability + GFM, strips nav/ads
-const $ = await client.toCheerio();          // jQuery-style traversal over the rendered DOM
+const { markdown } = await client.toMarkdown();   // Readability + GFM, strips nav/ads — returns { title, byline, excerpt, markdown, textContent }
+const $ = await client.toCheerio();               // jQuery-style traversal over the rendered DOM
 ```
 Or one-shot: `node cli.js markdown <url> out.md`
 

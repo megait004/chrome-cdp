@@ -238,6 +238,12 @@ class WebSocketController extends EventEmitter {
    */
   _onFrameSent(event) {
     const sock = this._getOrCreateSocket(event.requestId);
+    // note: attached after the handshake (e.g. a second process on a live tab)
+    // creates the socket lazily on its first frame — no handshake was seen, so
+    // the URL stays '' and the state must be corrected to 'open' (frames are
+    // flowing). Upgrade path: recover the URL via Network domain if CDP ever
+    // exposes a request-id → URL lookup for WebSocket requests.
+    if (sock.state === 'connecting' && !sock.handshakeResponse) sock.state = 'open';
     const frameData = event.response;
     const entry = {
       requestId: event.requestId,
@@ -261,6 +267,7 @@ class WebSocketController extends EventEmitter {
    */
   _onFrameRecv(event) {
     const sock = this._getOrCreateSocket(event.requestId);
+    if (sock.state === 'connecting' && !sock.handshakeResponse) sock.state = 'open'; // late attach — see _onFrameSent
     const frameData = event.response;
     const entry = {
       requestId: event.requestId,

@@ -21,6 +21,31 @@ class DOMController {
   }
 
   /**
+   * Revives an occluded window before keyboard interaction. When the Chrome
+   * window is covered or on an unshown virtual desktop (`visibilityState:
+   * 'hidden'` even with `hasFocus()` true), Chromium silently drops
+   * synthesized keyboard input — keyboard.type() produces no events at all.
+   * A minimized→normal bounds dance forces real window activation (measured:
+   * hidden→visible and keys flow; bringToFront and setWebLifecycleState do
+   * not help).
+   * @returns {Promise<void>}
+   */
+  async _ensureVisible() {
+    let vis;
+    try {
+      vis = await this._page.evaluate(() => document.visibilityState);
+    } catch { return; } // detached context — nothing to revive
+    if (vis === 'visible' || !this._cdp) return;
+    try {
+      const { windowId } = await this._cdp.send('Browser.getWindowForTarget');
+      await this._cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+      await new Promise((r) => setTimeout(r, 300));
+      await this._cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+      await new Promise((r) => setTimeout(r, 500));
+    } catch {} // best effort — the typed text may land in a visible case only
+  }
+
+  /**
    * Sets or updates active CDP session.
    * @param {import('puppeteer').CDPSession} cdpSession
    */
@@ -35,6 +60,84 @@ class DOMController {
    */
   async $(selector) {
     return this._page.$(selector);
+  }
+
+  /**
+   * Compact list of interactive elements currently in the DOM — the agent's
+   * eyes. Read this before acting and after every action, so selectors are
+   * picked from what the page actually shows, not from memory.
+   * @param {string} [selector] restrict the scan to a subtree
+   * @returns {Promise<{ url: string, readyState: string, count: number, elements: Array<object> }>}
+   */
+  async interactiveSnapshot(selector) {
+    return this._page.evaluate((scope) => {
+      const SELECTOR = 'a, button, input, select, textarea, [role=button], [role=link], [role=tab], [onclick], summary, label[for]';
+      const root = scope ? document.querySelector(scope) : document;
+      if (!root) return null;
+      const clean = (s, n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+      const seen = new Set();
+      const elements = [];
+      for (const el of root.querySelectorAll(SELECTOR)) {
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        const rect = el.getBoundingClientRect();
+        const text = clean(el.innerText || el.value || el.placeholder, 60);
+        const key = el.tagName + '|' + el.id + '|' + text;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        elements.push({
+          tag: el.tagName.toLowerCase(),
+          id: el.id || undefined,
+          name: el.name || undefined,
+          type: el.type && el.tagName !== 'BUTTON' ? el.type : undefined,
+          text: text || undefined,
+          href: el.tagName === 'A' ? clean(el.href, 80) : undefined,
+          placeholder: clean(el.placeholder, 40) || undefined,
+          value: clean(el.value, 40) || undefined,
+          disabled: el.disabled || undefined,
+          inViewport: rect.top < innerHeight && rect.bottom > 0 || undefined,
+        });
+        if (elements.length >= 150) break;
+      }
+      return { url: location.href, readyState: document.readyState, count: elements.length, elements };
+    }, selector || '');
+  }
+
+  /**
+   * Human-style click: find the interactive element whose visible text matches
+   * (exact match wins over substring, case-insensitive) and click it.
+   * @param {string} text
+   * @returns {Promise<{ tag: string, text: string } | null>} what was clicked, or null if nothing matched
+   */
+  async clickByText(text) {
+    return this._page.evaluate((target) => {
+      const SELECTOR = 'a, button, [role=button], [role=tab], [onclick], summary, input[type=submit], input[type=button]';
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const want = norm(target);
+      let exact = null, partial = null;
+      for (const el of document.querySelectorAll(SELECTOR)) {
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        const t = norm(el.innerText || el.value);
+        if (t === want) { exact = el; break; }
+        if (!partial && t.includes(want)) partial = el;
+      }
+      const el = exact || partial;
+      if (!el) return null;
+      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center', inline: 'center' });
+      el.click();
+      return { tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 60) };
+    }, text);
+  }
+
+  /**
+   * Presses a keyboard key on the focused element (Enter, Tab, Escape, ...).
+   * @param {string} key
+   * @returns {Promise<void>}
+   */
+  async press(key) {
+    await this._ensureVisible(); // occluded windows swallow synthesized keys
+    await this._page.keyboard.press(key);
   }
 
   /**
@@ -77,11 +180,37 @@ class DOMController {
    */
   async type(selector, text, options) {
     await this._page.waitForSelector(selector, { visible: true });
+    await this._ensureVisible(); // occluded windows swallow synthesized keys
     await this._page.type(selector, text, options);
+    // Verify the keys landed; if the revive failed they were dropped silently.
+    const readBack = await this.getValue(selector).catch(() => null);
+    if (readBack === null || !String(readBack).includes(text)) {
+      // note: fallback is CDP Input.insertText — delivered even while occluded
+      // (measured). Focus + select-all first, so it replaces the content
+      // deterministically instead of appending at an unknown cursor. It fires
+      // only an `input` event, no keydown/keyup — keystroke-dependent UIs
+      // (autocomplete-on-keypress) may need a visible window; upgrade path:
+      // per-key insertText loop.
+      await this._page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) throw new Error(`Element not found: ${sel}`);
+        el.focus();
+        // setSelectionRange throws InvalidStateError on email/number inputs —
+        // focus alone is enough there: insertText lands at the caret.
+        try { el.setSelectionRange(0, el.value.length); } catch {}
+      }, selector);
+      await this._cdp.send('Input.insertText', { text });
+    }
   }
 
   /**
    * Clears existing value and sets new value for an input or textarea element.
+   * Goes through the element prototype's native value setter: frameworks like
+   * React track the last value on the element and ignore plain `.value =`
+   * assignment, so the synthetic event would carry no change. The native
+   * setter bypasses that tracker and `input`/`change` then carry the update.
+   * If the app still ignores it, use `type()` — real per-key events are what
+   * framework-controlled inputs can never dedupe away.
    * @param {string} selector
    * @param {string} value
    */
@@ -91,8 +220,9 @@ class DOMController {
       (sel, val) => {
         const el = document.querySelector(sel);
         if (!el) throw new Error(`Element not found: ${sel}`);
-        el.value = val;
-        el.setAttribute('value', val);
+        const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+        if (desc && desc.set) desc.set.call(el, val);
+        else el.value = val;
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
       },

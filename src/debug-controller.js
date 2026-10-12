@@ -28,7 +28,6 @@ class DebugController extends EventEmitter {
       }
       if (options.asyncStackDepth !== undefined) {
         await this._cdp.send('Debugger.setAsyncCallStackDepth', { maxDepth: options.asyncStackDepth });
-        await this._cdp.send('Runtime.setAsyncCallStackDepth', { maxDepth: options.asyncStackDepth });
       }
       this._enabled = true;
     } catch (error) {
