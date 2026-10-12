@@ -69,9 +69,9 @@ Also exported: `startChrome({ port })`, `findChromePath()`, `checkCdpReady(port)
 |---|---|---|
 | `newPage({ autoEnableAll })` | `ChromeClient` | New tab with its own CDP session and controllers; shares the worker tracker |
 | `goto(url, options)` | navigation response or `null` | Defaults `waitUntil: 'domcontentloaded'`, `timeout: 15000`. Returns `null` instead of throwing when it times out but the DOM already parsed |
-| `setViewport({ width, height, deviceScaleFactor, isMobile })` | — | Defaults 1280×800 desktop |
-| `title()` / `content()` | `string` | Rendered title / full HTML |
-| `screenshot({ path, fullPage })` | buffer | |
+| `setViewport({ width, height, deviceScaleFactor, isMobile })` | — | Only when you need a specific viewport; an unconditional override puts the tab under Emulation, which can stop background frame production |
+| `title()` / `content()` / `url()` | `string` | Rendered title / full HTML / current URL (sync). `url()` is the truth after redirects — not the URL you passed to `goto()` |
+| `screenshot({ path, fullPage })` | buffer | Removed from the CLI — an LLM agent reads DOM, not images. `client.page.screenshot()` still exists in puppeteer; beware: a minimized Chrome window suspends compositing and the capture hangs (only `Browser.setWindowBounds('normal')` revives it) |
 | `evaluate(expressionOrFn, ...args)` | value | Runs in page context |
 | `toMarkdown(options)` | `{ title, markdown, ... }` | Readability + Turndown GFM |
 | `toCheerio()` | CheerioAPI | Rendered DOM, not the raw served HTML |
@@ -81,6 +81,8 @@ Also exported: `startChrome({ port })`, `findChromePath()`, `checkCdpReady(port)
 
 Pair `closePage()` + `disconnect()` in a `finally`.
 
+**Escape hatch: `client.page`** — the underlying Puppeteer `Page` for anything no controller covers (route interception, `page.waitForSelector`, `page.setCookie`, …). Prefer a controller method when one exists; `client.page.url()` and `client.page.goto()` work but bypass the recording guarantees of `goto()`. Also exposed: `client.browser`, `client.cdpSession` (raw CDP `send()`).
+
 ---
 
 ## client.dom — DOMController
@@ -89,9 +91,12 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 
 | Method | Notes |
 |---|---|
-| `click(selector, options)` | |
-| `type(selector, text, options)` | Keystroke-by-keystroke; fires the events a real user would |
-| `fill(selector, value)` | Sets the value directly — faster, but skips per-key handlers |
+| `interactiveSnapshot(selector?)` | Compact list of the interactive elements (buttons, links, inputs, `role=button`, …) **currently visible** — tag, id, text, href, placeholder, value, disabled, `inViewport` — plus `{ url, readyState, count }`. The agent's eyes: read it before acting and after every action, and pick selectors from it, never from memory |
+| `click(selector, options)` | Scrolls into view and clicks (DOM-level, works in background windows) |
+| `clickByText(text)` | Human-style: matches an interactive element by visible text (exact beats substring, case-insensitive); returns what was clicked, `null` if nothing matched |
+| `type(selector, text, options)` | Keystroke-by-keystroke; fires the events a real user would. Revives an occluded window first (`visibilityState: 'hidden'` makes Chromium drop synthesized keys entirely — a minimize→normal dance is the only revival; `bringToFront` does nothing). Self-verifying: if the keys still did not land, it falls back to `Input.insertText` (delivered even occluded; replaces the field, fires `input` only — no keydown/keyup) |
+| `press(key)` | Keyboard key on the focused element (`Enter`, `Tab`, `Escape`, …) |
+| `fill(selector, value)` | Sets the value through the native setter (frameworks like React ignore plain assignment — their value tracker dedupes it) and fires `input`/`change`. Faster than `type`. If the app still ignores the new value, switch to `type()` — per-key events cannot be deduped |
 | `getValue(selector)` / `getText(selector)` | |
 | `getAttribute(selector, attribute)` | |
 | `getOuterHtml(selector)` / `getHtml()` | |
@@ -119,11 +124,13 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 | `startRecording()` / `stopRecording()` / `clear()` | Recording is already on after `connect()` unless `autoEnableAll: false` |
 | `getTraffic(filter)` | Filter: `url` (string/RegExp), `method`, `resourceType`, `status`, `failedOnly` |
 | `getRequestPostData(query)` | Raw request body |
-| `getResponseBody(query)` | Response body. Only available while the response is still in Chrome's buffer — fetch it before navigating away |
+| `getResponseBody(query)` | `{ body, base64Encoded, parsedJson? }`. Bodies are stored durably (`Network.configureDurableMessages`, enabled by `startRecording()`) so they survive cross-process navigations — bounded by a 100 MB total / 5 MB per-resource buffer, and silently unavailable on older Chrome builds that reject the call. Still drain fresh when it matters |
 | `toRawRequest(query)` | RFC 7230 text with unnormalized headers, including `:method` / `:path` / `:authority`. Paste straight into Burp Repeater |
 | `toRawResponse(query)` | Same, for the response |
-| `searchTraffic(query)` | Scans URL + headers + bodies across every recorded request |
-| `getCookies(urls)` | |
+| `searchTraffic(query)` | Scans URL + headers + request postData across every recorded request |
+| `searchBodies(query, { requestId })` | Searches response bodies. Hybrid: native `Network.searchInResponseBody` first; entries Chrome can't search natively (durable-stored, evicted) fall back to a local match over `getResponseBody`. Accepts a substring, or `/pattern/flags` / a RegExp |
+| `getCookies(urls)` |
+| `replayXHR(requestId)` | Resends the XHR identical to the original (method, url, body, headers); the replay is recorded like any other request |
 | `clearCache()` / `clearCookies()` | Useful to force a cold load |
 
 `query` for the per-request methods is a `requestId` string, a URL substring, a RegExp, or `{ url }` / `{ requestId }`.
@@ -216,29 +223,38 @@ Worth checking when a site's crypto or network code is not in the main bundle �
 
 - **String vs RegExp.** Anywhere a filter takes `query` or `url`, a string means substring match and a RegExp means `.test()`. There is no glob syntax.
 - **Recording is cumulative.** `getTraffic()` and friends return everything since `connect()` or the last `clear()`, across navigations. Call `clear()` before the action you want to isolate.
-- **`getResponseBody` is the exception to the above** — bodies live in Chrome's buffer, not in this library's memory, and disappear on navigation.
+- **Tab lifetime.** `disconnect()` detaches without closing the tab — deliberate, so the user keeps interacting with it. `closePage()` is the explicit close (falls back to `about:blank` on the last tab so Chrome stays up). Each process that connects owns fresh recorder memory; only what happens after its `connect()` is in it.
+- **`getResponseBody` is the exception to the above** — bodies live in Chrome's storage, not in this library's memory. `configureDurableMessages` makes them survive navigations (bounded buffers, Chrome 154+); what arrived before `connect()` was never recorded at all.
 - **Everything is read-only against the target.** The controllers observe and extract; they do not modify requests in flight.
 
 ---
 
 ## CLI commands
 
-`node cli.js --help` prints the authoritative list. Each command is a full connect → goto → act → closePage cycle.
+`node cli.js --help` prints the authoritative list. Each command attaches to the live tab and **leaves it open** — page state (logins, SPA routes, WebSocket sessions) survives between commands, and you or the user close tabs by hand (`close`, or the X button). A command navigates only when given a URL; omit it and the command reads the page as it currently is.
 
 | Command | Notes |
 |---|---|
 | `start` | Launch Chrome with remote debugging |
-| `markdown <url> [destFile]` | Clean article text as GFM |
-| `dump-forms <url>` | Forms + hidden inputs as JSON |
-| `dump-storage <url>` | localStorage, sessionStorage, cookies |
-| `listeners <url> [selector]` | Defaults to `window` |
-| `search-sources <url> <query>` | Find the bundle before using the four commands below |
-| `download-bundle <url> <queryOrId> <destFile>` | |
-| `deobfuscate <url> <queryOrId> [destFile]` | Prints to stdout when `destFile` is omitted |
-| `unpack <url> <queryOrId> <destDir>` | |
-| `ast-search <url> <queryOrId> <pattern>` | |
-| `screenshot <url> [destFile]` | `--viewport WxH`, `--fullPage` |
-| `traffic <url> [--json]` | HTTP + WebSocket summary for the page load |
-| `eval <expression>` | Does **not** navigate — runs against the currently open tab |
+| `close` | Close the current tab; falls back to `about:blank` when it is the last tab so Chrome stays up |
+| `markdown [url] [destFile]` | Clean article text as GFM |
+| `dump-forms [url]` | Forms + hidden inputs as JSON |
+| `dump-storage [url]` | localStorage, sessionStorage, cookies |
+| `listeners [url] [selector]` | Defaults to `window` |
+| `search-sources [url] <query>` | Find the bundle before using the four commands below. Plain query = case-insensitive substring; `--re` switches to regex (a leading `/` is path-mangled by Git Bash, so regex is a flag, not a `/.../` literal) |
+| `download-bundle [url] <queryOrId> <destFile>` | |
+| `deobfuscate [url] <queryOrId> [destFile]` | Prints to stdout when `destFile` is omitted |
+| `unpack [url] <queryOrId> <destDir>` | |
+| `ast-search [url] <queryOrId> <pattern>` | |
+| `snapshot [url] [selector]` | Compact interactive-element list of the live tab (`--out` for the full list) — read before and after every action |
+| `click [url] <sel\|text=Text>` | Click + DOM delta (`urlChanged`, `added`, `removedCount`). `text=Label` matches by visible text |
+| `type [url] <sel> <text>` | Keystrokes + `valueAfter` echo + `valueMismatch` flag (focus-steal guard) + delta |
+| `fill [url] <sel> <value>` | Set value (fires input/change) + delta |
+| `press <key>` | Key on focused element + delta |
+| `wait [url] <selector> [--timeout S]` | Waits for a selector to appear (default 5s). On timeout, lists what IS interactive instead of failing blind |
+| `traffic [url] [--bodies] [--wait S]` | With a URL: navigate, wait for network idle, then for the first WS frame; capture the load. Without: attach to the live tab and record `--wait S` (default 5) while the user interacts — no navigation, WebSocket state undisturbed. `--bodies` drains each response body into the result (redirect hops, 204/no-cors beacons and evicted bodies appear as a `(...)` note, never silently `null`) |
 
-Global flags: `--port <n>`, `--json`, `--help`.
+**Late WebSocket attach.** A process that connects to a tab whose WebSocket was opened earlier misses the handshake — no socket URL is recoverable, so such sockets appear with `url: ''` (state corrected to `open`, since frames are flowing) and `traffic` adds a `note`. Frames on them still arrive and are searchable; to get the URL and handshake, load the page in the capturing process (`traffic <url>`).
+| `eval [url] <expression>` | With a URL: navigate, then evaluate — self-contained. Without: runs against the currently open tab and leaves it open, so follow-up `eval`s inherit page state (logins, SPA routes). Objects print as JSON, not `[object Object]` |
+
+Global flags: `--port <n>`, `--json`, `--out <file>` (JSON-producing commands write to the file instead of stdout — parent dirs are created; stdout gets the path + size), `--help`.

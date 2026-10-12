@@ -161,6 +161,15 @@ class ChromeClient {
   }
 
   /**
+   * Gets current page URL (post-redirect, sync). This is the source of truth
+   * for where the tab actually is — not the URL passed to `goto()`.
+   * @returns {string}
+   */
+  url() {
+    return this.page.url();
+  }
+
+  /**
    * Gets current page title.
    * @returns {Promise<string>}
    */
@@ -176,14 +185,10 @@ class ChromeClient {
     return this.dom.getHtml();
   }
 
-  /**
-   * Takes a screenshot of current page.
-   * @param {import('puppeteer').ScreenshotOptions} [options]
-   * @returns {Promise<Buffer | string>}
-   */
-  async screenshot(options = {}) {
-    return this.page.screenshot(options);
-  }
+  // screenshot() was removed: an LLM agent reads DOM, not images. The raw
+  // path stays reachable via client.page.screenshot() if ever needed — but
+  // note a minimized Chrome window suspends compositing and hangs
+  // captureScreenshot; only Browser.setWindowBounds('normal') revives it.
 
   /**
    * Evaluates JavaScript in the page context.

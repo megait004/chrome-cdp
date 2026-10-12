@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const EventEmitter = require('node:events');
 
+const NetworkController = require('../src/network-controller');
 const WorkerController = require('../src/worker-controller');
 const SourceController = require('../src/source-controller');
 const ConsoleController = require('../src/console-controller');
@@ -182,8 +183,38 @@ test('ConsoleController inspectObject handles float expression 1.2 as primitive 
   assert.equal(posIdResult[0].name, 'val');
 });
 
+test('searchBodies honors case sensitivity per query kind (native search unavailable → local fallback)', async () => {
+  const EventEmitter2 = require('node:events');
+  const cdp = new EventEmitter2();
+  // Force the local fallback path: no native Network.searchInResponseBody.
+  cdp.send = async (method, params) => {
+    if (method === 'Network.searchInResponseBody') throw new Error('not available');
+    if (method === 'Network.getResponseBody') return { body: 'Token=SECRET\ntoken=secret', base64Encoded: false };
+    return {};
+  };
+  const net = new NetworkController({}, cdp);
+  await net.startRecording();
+  cdp.emit('Network.requestWillBeSent', {
+    requestId: 'R1',
+    request: { url: 'https://example.test/x', method: 'GET', headers: {} },
+    type: 'Document',
+    timestamp: 1,
+  });
+  cdp.emit('Network.responseReceived', {
+    requestId: 'R1', timestamp: 2, response: { status: 200, statusText: 'OK', headers: {} },
+  });
+
+  // Plain string → case-insensitive substring: matches both lines.
+  assert.equal((await net.searchBodies('secret'))[0].matchLineNumbers.length, 2);
+  // RegExp without i → case-sensitive: only the SECRET line.
+  assert.deepEqual((await net.searchBodies(/SECRET/))[0].matchLineNumbers, [0]);
+  // /.../flags string with i → case-insensitive: both lines.
+  assert.equal((await net.searchBodies('/SECRET/i'))[0].matchLineNumbers.length, 2);
+  // /.../flags string without i → case-sensitive: only line 0.
+  assert.deepEqual((await net.searchBodies('/secret/'))[0].matchLineNumbers, [1]);
+});
+
 test('NetworkController keeps the pre-redirect hop instead of overwriting it', async () => {
-  const NetworkController = require('../src/network-controller');
   const EventEmitter2 = require('node:events');
 
   const cdp = new EventEmitter2();

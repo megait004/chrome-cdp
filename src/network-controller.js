@@ -47,6 +47,16 @@ class NetworkController extends EventEmitter {
     this._cdp.on('Network.loadingFailed', this._onLoadingFailed);
 
     await this._cdp.send('Network.enable');
+    // note: store response bodies outside the renderer so they survive
+    // cross-process navigations (protocol v0.0.1716261, experimental — older
+    // Chrome builds reject the command, hence the silent catch). Without it,
+    // bodies die on navigation; this is what makes getResponseBody reliable.
+    // Trade-off measured on Chrome 154: Network.searchInResponseBody cannot
+    // see durable-stored bodies, so searchBodies() falls back to a local match.
+    await this._cdp.send('Network.configureDurableMessages', {
+      maxTotalBufferSize: 100_000_000,
+      maxResourceBufferSize: 5_000_000,
+    }).catch(() => {});
     this._isRecording = true;
   }
 
@@ -301,6 +311,77 @@ class NetworkController extends EventEmitter {
       }
     }
     return matches;
+  }
+
+  /**
+   * Searches response bodies for a string/regex. Hybrid: tries CDP's native
+   * Network.searchInResponseBody first (fast, works on renderer-buffered
+   * bodies); entries Chrome reports as unavailable — including everything
+   * stored by configureDurableMessages — fall back to getResponseBody plus a
+   * local match, so results stay consistent in both storage modes.
+   * @param {string | RegExp} query substring, or RegExp with /flags suffix
+   * @param {{ requestId?: string }} [options] limit to one request
+   * @returns {Promise<Array<{ requestId, url, matchLineNumbers }>>}
+   */
+  async searchBodies(query, options = {}) {
+    const re = typeof query === 'string' ? query.match(/^\/(.+)\/([gimsuy]*)$/s) : null;
+    // A RegExp instance must contribute its source, not String(query)'s '/.../' form.
+    const searchQuery = query instanceof RegExp ? query.source : (re ? re[1] : String(query));
+    const isRegex = typeof query !== 'string' || Boolean(re);
+    const caseSensitive = re
+      ? !re[2].includes('i')          // /.../flags string: case-sensitive unless the i flag
+      : query instanceof RegExp ? !query.ignoreCase // RegExp instance: its own flag
+      : false;                        // plain string: substring search is case-insensitive
+    const localRegex = new RegExp(searchQuery, caseSensitive ? '' : 'i');
+
+    const targets = options.requestId
+      ? [this._entries.get(options.requestId)].filter(Boolean)
+      : Array.from(this._entries.values());
+
+    const results = [];
+    for (const entry of targets) {
+      const id = entry.cdpRequestId || entry.id;
+      let lineNumbers = null;
+      try {
+        const res = await this._cdp.send('Network.searchInResponseBody', {
+          requestId: id,
+          query: searchQuery,
+          caseSensitive,
+          isRegex,
+        });
+        lineNumbers = res.result.map((m) => m.lineNumber);
+      } catch {}
+      if (!lineNumbers) {
+        // Native search can't see this body (evicted or durable-stored).
+        // Fall back to a local match over getResponseBody; text bodies only.
+        try {
+          const body = await this.getResponseBody(id);
+          if (body && body.base64Encoded) lineNumbers = [];
+          else {
+            lineNumbers = String(body.body || '')
+              .split('\n')
+              .map((line, i) => (localRegex.test(line) ? i : -1))
+              .filter((i) => i >= 0);
+          }
+        } catch { continue; } // body gone entirely — nothing to search
+      }
+      if (lineNumbers.length > 0) {
+        results.push({ requestId: entry.id, url: entry.url, matchLineNumbers: lineNumbers });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Replays an XHR identical to the original (method, url, body, headers) via
+   * CDP Network.replayXHR. The replay fires as a fresh recorded request.
+   * @param {string} requestId request id from getTraffic()
+   * @returns {Promise<void>}
+   */
+  async replayXHR(requestId) {
+    const entry = this._entries.get(this._resolveRequestId(requestId));
+    if (!entry) throw new Error(`Unknown request id: ${requestId}`);
+    await this._cdp.send('Network.replayXHR', { requestId: entry.cdpRequestId || entry.id });
   }
 
   /**
