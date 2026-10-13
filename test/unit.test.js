@@ -407,6 +407,59 @@ test('setBreakpoint rejects a condition passed into the columnNumber slot', asyn
   assert.equal(sent.at(-1).params.columnNumber, 0, 'the default still applies');
 });
 
+test('removeBreakpoint untracks on success (keeps id on failure); disable resets pause state', async () => {
+  const DebugController = require('../src/debug-controller');
+  const EventEmitter7 = require('node:events');
+  const cdp = new EventEmitter7();
+  const sent = [];
+  let failRemove = false;
+  cdp.send = async (method, params) => {
+    sent.push({ method, params });
+    if (method === 'Debugger.removeBreakpoint' && failRemove) throw new Error('nope');
+    if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-9', locations: [] };
+    return {};
+  };
+  const debugCtl = new DebugController(cdp);
+  await debugCtl.enable();
+  await debugCtl.setBreakpoint('https://x.test/app.js', 3);
+  await debugCtl.removeBreakpoint('bp-9');
+  const n = sent.length;
+  debugCtl.disable();
+  await new Promise((r) => setTimeout(r, 20)); // flush fire-and-forget sends
+  const after = sent.slice(n);
+  assert.ok(!after.some((s) => s.method === 'Debugger.removeBreakpoint'), 'stale re-remove sent for an already-removed id');
+  assert.ok(after.some((s) => s.method === 'Debugger.setPauseOnExceptions' && s.params.state === 'none'), 'disable must reset pause state');
+
+  // failure path: the id stays tracked so disable() retries the removal
+  await debugCtl.enable();
+  await debugCtl.setBreakpoint('https://x.test/app.js', 4);
+  failRemove = true;
+  await assert.rejects(() => debugCtl.removeBreakpoint('bp-9'));
+  const m = sent.length;
+  debugCtl.disable();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(sent.slice(m).some((s) => s.method === 'Debugger.removeBreakpoint'), 'failed id not retried on disable');
+});
+
+test('pauseOnExceptions state is re-asserted after navigation and forgotten on disable', async () => {
+  const DebugController = require('../src/debug-controller');
+  const EventEmitter8 = require('node:events');
+  const cdp = new EventEmitter8();
+  const sent = [];
+  cdp.send = async (method, params) => { sent.push({ method, params }); return {}; };
+  const debugCtl = new DebugController(cdp);
+  await debugCtl.enable({ pauseOnExceptions: 'uncaught' });
+  assert.equal(sent.filter((s) => s.method === 'Debugger.setPauseOnExceptions').length, 1, 'initial send missing');
+  cdp.emit('Runtime.executionContextsCleared'); // navigation wipes backend state on some stacks
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(sent.at(-1), { method: 'Debugger.setPauseOnExceptions', params: { state: 'uncaught' } }, 'no re-assert after navigation');
+  debugCtl.disable();
+  const n = sent.length;
+  cdp.emit('Runtime.executionContextsCleared');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(sent.length, n, 're-assert fired after disable');
+});
+
 test('getResponseBody refuses a redirect hop instead of returning the final response body', async () => {
   const NetworkController = require('../src/network-controller');
   const EventEmitter6 = require('node:events');

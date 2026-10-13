@@ -2,3 +2,9 @@ node_modules/
 .analysis/
 *.log
 .tmp/
+# Vendored ChromeDevTools/devtools-protocol reference clone (6MB, has its own
+# .git for `git -C references/devtools-protocol pull`). AI reads
+# json/js_protocol.json + json/browser_protocol.json from disk; the skill repo
+# itself stays lean. Re-clone with:
+#   git clone --depth 1 https://github.com/ChromeDevTools/devtools-protocol.git references/devtools-protocol
+references/devtools-protocol/
