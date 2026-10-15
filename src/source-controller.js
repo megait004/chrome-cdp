@@ -112,7 +112,6 @@ class SourceController extends EventEmitter {
       }
     }
 
-    // If it looks like numeric ID, return as is
     if (/^\d+$/.test(scriptIdOrUrl)) {
       return scriptIdOrUrl;
     }

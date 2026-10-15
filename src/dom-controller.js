@@ -95,7 +95,7 @@ class DOMController {
           placeholder: clean(el.placeholder, 40) || undefined,
           value: clean(el.value, 40) || undefined,
           disabled: el.disabled || undefined,
-          inViewport: rect.top < innerHeight && rect.bottom > 0 || undefined,
+          inViewport: (rect.top < innerHeight && rect.bottom > 0) || undefined,
         });
         if (elements.length >= 150) break;
       }
@@ -426,7 +426,6 @@ class DOMController {
     return this._page.evaluate(() => {
       const items = [];
 
-      // Hidden inputs
       document.querySelectorAll('input[type="hidden"]').forEach((el) => {
         items.push({
           category: 'input[type="hidden"]',
@@ -437,7 +436,6 @@ class DOMController {
         });
       });
 
-      // CSS-hidden elements
       document
         .querySelectorAll('[hidden], [style*="display: none"], [style*="display:none"]')
         .forEach((el) => {

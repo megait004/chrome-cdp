@@ -21,7 +21,9 @@ const astGrep = require('@ast-grep/napi');
  *   port?: number,
  *   autoLaunch?: boolean,
  *   browserURL?: string,
- *   browserWSEndpoint?: string
+ *   browserWSEndpoint?: string,
+ *   autoEnableAll?: boolean,
+ *   protocolTimeout?: number
  * }} [options]
  * @returns {Promise<ChromeClient>}
  */

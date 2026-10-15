@@ -185,14 +185,16 @@ Frames only exist after the handshake, and many only appear in response to inter
 
 | Method | Notes |
 |---|---|
-| `enable({ pauseOnExceptions })` | |
-| `setBreakpoint(url, lineNumber, columnNumber = 0, condition)` | `condition` is a JS expression — the breakpoint only fires when it is truthy |
-| `removeBreakpoint(breakpointId)` | |
-| `pause()` / `resume()` / `stepOver()` / `stepInto()` / `stepOut()` | |
-| `evaluateOnCallFrame(callFrameId, expression, options)` | Reads locals and closure variables at the paused frame — the way to capture a value that exists for one tick |
-| `disable()` | |
+| `enable({ pauseOnExceptions, asyncStackDepth })` | `pauseOnExceptions`: `true` (= `'all'`) or spec enum `'caught'` \| `'uncaught'` \| `'all'` — Debugger.setPauseOnExceptions state, validated. Armed state is re-sent on `Runtime.executionContextsCleared` because a reload wipes it on some stacks — arm *after* `goto()` when the pause must apply to the fresh load |
+| `setBreakpoint(url, lineNumber, columnNumber = 0, condition)` | `condition` is a JS expression — the breakpoint only fires when it is truthy. Raw protocol semantics: `lineNumber` counts from the top of the *document*, so for an inline `<script>` starting at document line N add N (the script's `startLine` from `getScripts()`). The CLI `break` command does this offset for you — pass script-relative lines there |
+| `removeBreakpoint(breakpointId)` | Untracks the id on success (a throw keeps it tracked so `disable()` retries the removal) |
+| `pause()` / `resume()` / `stepOver()` / `stepInto()` / `stepOut()` | Raw passthrough — `resume()` on a non-paused target is a protocol error, so guard it |
+| `evaluateOnCallFrame(callFrameId, expression, options)` | Reads locals and closure variables at the paused frame — the way to capture a value that exists for one tick. Options (spec passthrough): `silent` (eval faults don't report / re-pause — overrides pause-on-exceptions), `includeCommandLineAPI` (`$0`, `$_` helpers), `objectGroup` |
+| `disable()` | Detaches listeners, removes every tracked breakpoint, resets pause-on-exceptions to `none` — leaves the target as found |
 
 Emits `paused` with `{ callFrames, reason }`, and `client.debug.paused` holds that same payload (or `null`) if you would rather poll than subscribe. The page is frozen until `resume()`, so always resume — including on the error path.
+
+Protocol reference (vendored, update with `git -C references/devtools-protocol pull`): `references/devtools-protocol/json/js_protocol.json`, domain `Debugger` — full parameter shapes for `setBreakpointByUrl`, `evaluateOnCallFrame`, `setPauseOnExceptions`, stepping, etc. Prefer the CLI `break` command over raw calls: one shot sets the breakpoint, waits for the hit, captures the stack, evaluates on the top frame (`--eval`), and resumes. Multi-step flows (stepOver/stepInto in a loop, conditional re-pausing) cannot span CLI invocations — pause state dies with the CDP session — so write a `.tmp/` script against `client.debug` for those.
 
 ---
 

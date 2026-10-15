@@ -157,7 +157,6 @@ class NetworkController extends EventEmitter {
         return res.postData;
       }
     } catch {
-      // Fall back to cached postData captured during requestWillBeSent
       if (entry && entry.postData) {
         return entry.postData;
       }
@@ -229,7 +228,6 @@ class NetworkController extends EventEmitter {
 
     const lines = [`${method} ${pathAndQuery} ${httpVersion}`];
 
-    // Priority to rawHeaders from ExtraInfo, otherwise headers
     const headers = entry.rawHeaders || entry.headers || {};
     if (!headers['host'] && !headers['Host']) {
       lines.push(`Host: ${parsedUrl.host}`);

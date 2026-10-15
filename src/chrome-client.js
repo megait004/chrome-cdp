@@ -47,7 +47,8 @@ class ChromeClient {
    *   port?: number,
    *   browserURL?: string,
    *   browserWSEndpoint?: string,
-   *   autoEnableAll?: boolean
+   *   autoEnableAll?: boolean,
+   *   protocolTimeout?: number
    * }} [options]
    * @returns {Promise<ChromeClient>}
    */
@@ -69,7 +70,6 @@ class ChromeClient {
 
     const browser = await puppeteer.connect(connectOpts);
 
-    // Reuse existing page or open a new one
     const pages = await browser.pages();
     let page = pages.length > 0 ? pages[0] : await browser.newPage();
     if (page.url().startsWith('chrome://')) {
@@ -80,7 +80,6 @@ class ChromeClient {
     const client = new ChromeClient(browser, page, cdp);
     await client.workers.ready;
 
-    // Auto-enable standard controllers if requested (default: true)
     if (options.autoEnableAll !== false) {
       await Promise.all([
         client.network.startRecording(),

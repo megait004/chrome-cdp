@@ -13,18 +13,38 @@ class DebugController extends EventEmitter {
     this._breakpoints = new Set();
     this._onPaused = (event) => { this._paused = event; this.emit('paused', event); };
     this._onResumed = () => { this._paused = null; this.emit('resumed'); };
+    this._pauseState = null; // armed pauseOnExceptions enum; re-asserted after navigation
+    this._onContextsCleared = () => {
+      // note: pause-on-exceptions does not reliably survive a navigation —
+      // some stacks wipe it on reload (cf. Lynx caching the state and
+      // re-sending setPauseOnExceptions after reloading), so re-assert the
+      // armed state for the fresh contexts. Harmless when the backend kept
+      // it: same state, sent idempotently.
+      if (this._enabled && this._pauseState) {
+        this._cdp.send('Debugger.setPauseOnExceptions', { state: this._pauseState }).catch(() => {});
+      }
+    };
   }
   async enable(options = {}) {
     if (this._enabled) return;
     this._cdp.on('Debugger.paused', this._onPaused);
     this._cdp.on('Debugger.resumed', this._onResumed);
+    this._cdp.on('Runtime.executionContextsCleared', this._onContextsCleared);
     try {
       await Promise.all([
         this._cdp.send('Debugger.enable'),
         this._cdp.send('Runtime.enable'),
       ]);
-      if (options.pauseOnExceptions) {
-        await this._cdp.send('Debugger.setPauseOnExceptions', { state: 'all' });
+      // Spec enum for Debugger.setPauseOnExceptions: none | caught | uncaught | all.
+      // `true` keeps backward compat (means 'all'); false/'none'/absent all mean "leave it".
+      const pauseOpt = options.pauseOnExceptions;
+      const state = pauseOpt === true ? 'all' : pauseOpt;
+      if (state !== undefined && state !== false && state !== 'none') {
+        if (!['caught', 'uncaught', 'all'].includes(state)) {
+          throw new TypeError(`pauseOnExceptions must be true or one of 'caught' | 'uncaught' | 'all', got ${JSON.stringify(pauseOpt)}`);
+        }
+        await this._cdp.send('Debugger.setPauseOnExceptions', { state });
+        this._pauseState = state;
       }
       if (options.asyncStackDepth !== undefined) {
         await this._cdp.send('Debugger.setAsyncCallStackDepth', { maxDepth: options.asyncStackDepth });
@@ -56,22 +76,40 @@ class DebugController extends EventEmitter {
   stepOut() { return this._cdp.send('Debugger.stepOut'); }
   evaluateOnCallFrame(callFrameId, expression, options = {}) {
     if (!callFrameId || typeof expression !== 'string') throw new TypeError('callFrameId and expression are required');
+    // Spec passthrough for Debugger.evaluateOnCallFrame: silent (don't report
+    // exceptions / don't re-pause — overrides pause-on-exceptions), and
+    // includeCommandLineAPI (DevTools $0 / $_ helpers). returnByValue + awaitPromise
+    // default true so the CLI gets plain JSON instead of object handles.
     return this._cdp.send('Debugger.evaluateOnCallFrame', {
       callFrameId, expression, returnByValue: options.returnByValue !== false,
       awaitPromise: options.awaitPromise !== false,
+      ...(options.silent !== undefined ? { silent: Boolean(options.silent) } : {}),
+      ...(options.includeCommandLineAPI !== undefined ? { includeCommandLineAPI: Boolean(options.includeCommandLineAPI) } : {}),
+      ...(options.objectGroup !== undefined ? { objectGroup: options.objectGroup } : {}),
     });
   }
-  removeBreakpoint(breakpointId) { return this._cdp.send('Debugger.removeBreakpoint', { breakpointId }); }
+  async removeBreakpoint(breakpointId) {
+    await this._cdp.send('Debugger.removeBreakpoint', { breakpointId });
+    // note: untrack AFTER the send succeeds — a throw means Chrome still holds
+    // the breakpoint, so disable() must retry the removal instead of forgetting it.
+    this._breakpoints.delete(breakpointId);
+  }
   get paused() { return this._paused; }
   disable() {
     this._cdp.off('Debugger.paused', this._onPaused);
     this._cdp.off('Debugger.resumed', this._onResumed);
+    this._cdp.off('Runtime.executionContextsCleared', this._onContextsCleared);
+    // note: leave the target as we found it — pause-on-exceptions back to 'none'
+    // and every armed breakpoint removed (both best effort), so nothing we set
+    // survives disconnect into the live tab.
+    this._cdp.send('Debugger.setPauseOnExceptions', { state: 'none' }).catch(() => {});
     for (const breakpointId of this._breakpoints) {
       this._cdp.send('Debugger.removeBreakpoint', { breakpointId }).catch(() => {});
     }
     this._breakpoints.clear();
     this._paused = null;
     this._enabled = false;
+    this._pauseState = null;
   }
 }
 

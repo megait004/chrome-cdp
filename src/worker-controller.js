@@ -28,6 +28,9 @@ class WorkerController extends EventEmitter {
   }
 
   _getWorkerType(target) {
+    // note: raw CDP type first ON PURPOSE — puppeteer reports dedicated workers
+    // as 'other' (public target.type() loses the info), while the CDP targetInfo
+    // carries the real 'worker' type. Pinned by unit.test.js 'dedicated worker'.
     const raw = typeof target._getTargetInfo === 'function' ? target._getTargetInfo()?.type : null;
     const type = raw || (typeof target.type === 'function' ? target.type() : null);
     return ['worker', 'service_worker', 'shared_worker'].includes(type) ? type : null;
