@@ -11,9 +11,9 @@ const KEY_CODES = {
 /** @param {string} code */
 function keyCodeOf(code) {
   if (KEY_CODES[code] !== undefined) return KEY_CODES[code];
-  const letter = code.match(/^Key([A-Z])$/);
+  const letter = /^Key([A-Z])$/.exec(code);
   if (letter) return letter[1].codePointAt(0);
-  const digit = code.match(/^Digit(\d)$/);
+  const digit = /^Digit(\d)$/.exec(code);
   if (digit) return digit[1].codePointAt(0);
   throw new Error(`Unknown key code "${code}". Use a KeyboardEvent.code such as KeyW, Space, ArrowLeft.`);
 }
@@ -54,7 +54,7 @@ class VisualController {
    */
   frame(spec) {
     const frames = this.frames();
-    if (typeof spec === 'number' || /^d+$/.test(String(spec))) {
+    if (typeof spec === 'number' || /^\d+$/.test(String(spec))) {
       const f = frames[Number(spec)];
       if (!f) throw new Error(`No frame at index ${spec}; the page has ${frames.length} child frame(s). List them with: node cli.js frames`);
       return f;
@@ -109,6 +109,9 @@ class VisualController {
     // Chromium drops a press that arrives in the same frame as the move it follows
     await new Promise((r) => setTimeout(r, 50));
     await this._cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at, buttons: pressed, clickCount });
+    // A human press lasts ~100 ms. Games poll the button once per frame, so an instant release
+    // can be missed entirely (GameMaker's mouse_check_button_pressed never sees it).
+    await new Promise((r) => setTimeout(r, 100));
     await this._cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...at, buttons: 0, clickCount });
   }
 
