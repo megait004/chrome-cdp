@@ -48,7 +48,7 @@ class DOMController {
         // Sampling loop: must observe one state before deciding whether to wait again.
         const state = await this._page.evaluate(() => document.visibilityState).catch(() => null); // NOSONAR S9382
         if (state === want) return;
-        await new Promise((r) => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 50)); // NOSONAR S9382
       }
     };
     try {
@@ -357,7 +357,7 @@ class DOMController {
    * Audits registered DOM event listeners on an element, 'window', or 'document' via CDP DOMDebugger.
    * Crucial for finding DOM XSS sinks, PostMessage handlers, and hidden action handlers.
    * @param {string} [target='window'] - CSS selector or 'window' or 'document'
-   * @returns {Promise<Array<object>>}
+   * @returns {Promise<Array<Pick<import('devtools-protocol').Protocol.DOMDebugger.EventListener, 'type' | 'useCapture' | 'passive' | 'once' | 'scriptId' | 'lineNumber' | 'columnNumber'> & { handlerDescription: string | null }>>}
    */
   async getEventListeners(target = 'window') {
     if (!this._cdp) {

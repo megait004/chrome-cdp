@@ -19,10 +19,6 @@ const VisualController = require('./visual-controller');
 puppeteer.use(StealthPlugin());
 
 /**
- * Unified high-level Chrome CDP Client.
- * Orchestrates DOM manipulation, network inspection, console interaction, and source analysis.
- */
-/**
  * Every controller a tab exposes, as ChromeClient wires them.
  * @typedef {{ dom: InstanceType<typeof DOMController>, network: InstanceType<typeof NetworkController>, websocket: InstanceType<typeof WebSocketController>, console: InstanceType<typeof ConsoleController>, sources: InstanceType<typeof SourceController>, debug: InstanceType<typeof DebugController>, performance: InstanceType<typeof PerformanceController>, visual: InstanceType<typeof VisualController> }} Controllers
  */
@@ -47,6 +43,10 @@ function createControllers(page, cdpSession) {
   };
 }
 
+/**
+ * Unified high-level Chrome CDP Client.
+ * Orchestrates DOM manipulation, network inspection, console interaction, and source analysis.
+ */
 class ChromeClient {
   /**
    * @param {import('puppeteer-core').Browser} browser

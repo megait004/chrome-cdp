@@ -26,7 +26,6 @@ class SourceController extends EventEmitter {
     if (!cdpSession) throw new TypeError('CDPSession is required for SourceController');
 
     this._cdp = cdpSession;
-    /** @type {Map<string, object>} */
     /** @type {Map<string, ScriptInfo>} */
     this._scripts = new Map();
     this._isEnabled = false;
@@ -292,7 +291,7 @@ class SourceController extends EventEmitter {
    * @param {string} scriptIdOrUrl
    * @param {string} pattern - AST pattern (e.g. "console.log($ARG)" or "fetch($URL, $$$)")
    * @param {{ deobfuscateFirst?: boolean }} [options]
-   * @returns {Promise<Array<{ text: string, range: object, metaMatches: Record<string, string> }>>}
+   * @returns {Promise<Array<{ text: string, range: import('@ast-grep/napi').Range, metaMatches: Record<string, string> }>>}
    */
   async searchAst(scriptIdOrUrl, pattern, options = {}) {
     if (!pattern) throw new TypeError('AST pattern is required');

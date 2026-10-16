@@ -19,7 +19,6 @@ class WebSocketController extends EventEmitter {
     if (!cdpSession) throw new TypeError('CDPSession is required for WebSocketController');
 
     this._cdp = cdpSession;
-    /** @type {Map<string, object>} */
     /** @type {Map<string, WsSocket>} */
     this._sockets = new Map();
     this._isRecording = false;

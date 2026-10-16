@@ -74,7 +74,7 @@ class DebugController extends EventEmitter {
           'To pass a condition without a column, call setBreakpoint(url, line, 0, condition).'
       );
     }
-    /** @type {{ url: string, lineNumber: number, columnNumber: number, condition?: string }} */
+    /** @type {import('devtools-protocol').Protocol.Debugger.SetBreakpointByUrlRequest} */
     const params = { url, lineNumber, columnNumber };
     if (condition) params.condition = condition;
     const result = await this._cdp.send('Debugger.setBreakpointByUrl', params);

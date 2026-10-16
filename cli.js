@@ -4,22 +4,23 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { connect, startChrome, waitUntil, checkCdpReady } = require('./index');
+const T = require('./src/timeouts');
+
+let tabIndex = 0; // set from --tab; every command attaches to this tab
 
 /**
  * Attaches to a Chrome that is already running on `port`. Never launches one:
  * a command must not open a browser on the user's profile unannounced. Use
  * `node cli.js start` for that.
+ * @param {number} port
+ * @returns {Promise<Client>}
  */
-let tabIndex = 0; // set from --tab; every command attaches to this tab
-
-/** @param {number} port @returns {Promise<Client>} */
 async function attach(port) {
   if (!(await checkCdpReady(port))) {
     throw new Error(`Chrome is not running on port ${port}. Start it with: node cli.js start`);
   }
   return connect({ port, autoLaunch: false, tab: tabIndex });
 }
-const T = require('./src/timeouts');
 
 /**
  * What main() hands every command. Handlers take what they need from it.
@@ -189,7 +190,6 @@ function interactiveHints(elements, { limit = 8, skipDisabled = false } = {}) {
  * Detaches from the browser. The tab is deliberately left open — the user
  * closes tabs by hand, and page state (logins, SPA routes, WebSocket
  * sessions) survives between commands. `close` is the explicit cleanup path.
- * @param {import('./src/chrome-client.js')} client
  * @param {Client} client
  */
 async function release(client) {
@@ -425,7 +425,7 @@ async function cmdTraffic({ args, port, isJson, outFile }) {
 
   const httpTraffic = client.network.getTraffic();
   const wsSockets = client.websocket.getSockets();
-  /** @type {{ finalUrl: string, mode: string, httpTraffic: unknown, wsSockets: unknown, note?: string }} */
+  /** @type {{ finalUrl: string, mode: string, httpTraffic: Array<import('./src/network-controller').TrafficEntry & { body?: unknown, parsedJson?: unknown }>, wsSockets: import('./src/types/websocket').WsSocket[], note?: string }} */
   const result = { finalUrl: client.url(), mode: url ? 'load' : 'live', httpTraffic, wsSockets };
   if (!url && wsSockets.some((s) => !s.url)) {
     result.note = 'socket(s) with no URL were opened before this attach — the handshake was missed, but their frames still flow';

@@ -45,7 +45,7 @@ async function assertEventually(fn, options = {}) {
 /**
  * Collects emitted payloads instead of polling for their effects. Returns what it
  * collected, partial included.
- * @param {{ on: Function, off: Function }} emitter
+ * @param {{ on: (event: string, fn: (payload: any) => void) => unknown, off: (event: string, fn: (payload: any) => void) => unknown }} emitter
  * @param {string} eventName
  * @param {{ timeout?: number, count?: number, where?: (payload: any) => boolean }} [options]
  * @returns {Promise<any[]>} Collected payloads, in arrival order.
@@ -121,7 +121,8 @@ function describeFailedWait(observed, { timeout, min, describe }) {
 
 /** @param {unknown} value */
 function summarize(value) {
-  if (value === null || value === undefined) return String(value);
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
   const length = /** @type {{ length?: unknown }} */ (value).length;
   if (typeof length === 'number') return `length ${length}`;
   return typeof value;
