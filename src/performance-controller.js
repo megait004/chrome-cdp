@@ -3,7 +3,6 @@
 const { performance } = require('node:perf_hooks');
 const { TRACE_STOP_TIMEOUT_MS } = require('./timeouts');
 
-/** Lightweight timing, metrics and trace capture for bottleneck analysis. */
 class PerformanceController {
   /**
    * @param {import('puppeteer-core').Page} page
@@ -31,8 +30,11 @@ class PerformanceController {
     // Enables the Performance domain up front so counters are already ticking when the
     // trace starts; a first read taken after Tracing.start would miss the early samples.
     await this.metrics();
+    const includedCategories = (options.categories || 'devtools.timeline,v8.execute,disabled-by-default-v8.cpu_profiler')
+      .split(',').map((c) => c.trim()).filter(Boolean);
+    // Tracing.start.categories is deprecated in the protocol; traceConfig carries the same list.
     await this._cdp.send('Tracing.start', {
-      categories: options.categories || 'devtools.timeline,v8.execute,disabled-by-default-v8.cpu_profiler',
+      traceConfig: { includedCategories },
       transferMode: 'ReturnAsStream',
     });
     this._tracing = true;
@@ -43,24 +45,31 @@ class PerformanceController {
     const timeout = options.timeout ?? TRACE_STOP_TIMEOUT_MS;
     let stream;
     try {
-      stream = await new Promise((resolve, reject) => {
+      stream = await /** @type {Promise<string>} */ (new Promise((resolve, reject) => {
         /** @type {ReturnType<typeof setTimeout> | undefined} */
         let timer;
-        /** @param {(v: any) => void} finish */
-        const settle = (finish) => (/** @type {any} */ value) => {
+        const done = () => {
           clearTimeout(timer);
           this._cdp.off('Tracing.tracingComplete', onComplete);
-          finish(value);
         };
-        const onComplete = (/** @type {import('devtools-protocol').Protocol.Tracing.TracingCompleteEvent} */ event) => settle(resolve)(event.stream);
-        const fail = settle(reject);
+        /** @param {import('devtools-protocol').Protocol.Tracing.TracingCompleteEvent} event */
+        const onComplete = (event) => {
+          done();
+          if (event.stream) resolve(event.stream);
+          else reject(new Error('Tracing.tracingComplete arrived without a stream handle'));
+        };
+        /** @param {unknown} error */
+        const fail = (error) => {
+          done();
+          reject(error);
+        };
         this._cdp.on('Tracing.tracingComplete', onComplete);
         timer = setTimeout(
           () => fail(new Error(`Tracing.tracingComplete never arrived within ${timeout}ms`)),
           timeout
         );
         this._cdp.send('Tracing.end').catch(fail);
-      });
+      }));
     } catch (error) {
       this._tracing = false;
       throw error;
@@ -78,7 +87,12 @@ class PerformanceController {
     }
     return trace;
   }
-  /** @param {(...args: any[]) => any} fn @param {...any} args */
+  /**
+   * @template {unknown[]} P
+   * @template R
+   * @param {(...args: import('puppeteer-core').InnerParams<P>) => R} fn
+   * @param {P} args
+   */
   async measure(fn, ...args) {
     const before = await this.metrics();
     const started = performance.now();

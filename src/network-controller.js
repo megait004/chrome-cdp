@@ -2,11 +2,11 @@
 
 const EventEmitter = require('node:events');
 const matchesQuery = require('./match-query');
+const { messageOf } = require('./util');
 
 /**
- * One recorded request. Every leaf type is read from the CDP protocol, so a protocol change
- * shows up here as a type error instead of drifting. Fields a later event fills in are null
- * until it arrives; bodies come from getResponseBody, not from an event.
+ * One recorded request. Leaf types come from the CDP protocol, so a protocol change fails the
+ * type check. Fields filled by a later event are null until it arrives.
  * @typedef {object} TrafficEntry
  * @property {string} id
  * @property {string} cdpRequestId
@@ -45,14 +45,8 @@ const matchesQuery = require('./match-query');
  */
 
 /**
- * Advanced Network Controller built on raw Chrome DevTools Protocol (CDP) events.
- * Captures raw headers, unnormalized pseudo-headers, raw request POST data,
- * response bodies, cookies, and formats traffic for security research and reverse engineering.
- */
-/**
- * Rebuilds a POST body from the protocol's postDataEntries. Each entry carries one base64
- * chunk; the deprecated postData string is no longer used. Null when there is no body.
- * note: entries can be absent for very large bodies; getRequestPostData fetches those.
+ * Rebuilds the POST body from postDataEntries (base64 chunks). Null when there is no body.
+ * Very large bodies may omit entries; getRequestPostData fetches them.
  * @param {Array<{ bytes?: string }> | undefined} entries
  * @returns {string | null}
  */
@@ -81,12 +75,13 @@ class NetworkController extends EventEmitter {
     this._onRequestExtraInfo = this._onRequestExtraInfo.bind(this);
     this._onResponseReceived = this._onResponseReceived.bind(this);
     this._onResponseExtraInfo = this._onResponseExtraInfo.bind(this);
+    /** @type {Map<string, TrafficEntry[]>} requestId -> finished redirect hops still waiting for their raw headers */
+    this._hopsAwaitingRaw = new Map();
     this._onLoadingFinished = this._onLoadingFinished.bind(this);
     this._onLoadingFailed = this._onLoadingFailed.bind(this);
   }
 
   /**
-   * Initializes network domain and hooks into raw CDP network events.
    * @returns {Promise<void>}
    */
   async startRecording() {
@@ -105,7 +100,7 @@ class NetworkController extends EventEmitter {
     // Chrome builds reject the command, hence the silent catch). Without it,
     // bodies die on navigation; this is what makes getResponseBody reliable.
     // Trade-off: Network.searchInResponseBody may not see durable-stored bodies,
-    // so searchBodies() falls back to a local match (not covered by an automated test).
+    // so searchBodies() falls back to a local match.
     await this._cdp.send('Network.configureDurableMessages', {
       maxTotalBufferSize: 100_000_000,
       maxResourceBufferSize: 5_000_000,
@@ -113,9 +108,6 @@ class NetworkController extends EventEmitter {
     this._isRecording = true;
   }
 
-  /**
-   * Stops capturing network traffic.
-   */
   stopRecording() {
     if (!this._isRecording) return;
 
@@ -129,15 +121,11 @@ class NetworkController extends EventEmitter {
     this._isRecording = false;
   }
 
-  /**
-   * Clears recorded network history.
-   */
   clear() {
     this._entries.clear();
   }
 
   /**
-   * Retrieves recorded network traffic with optional filtering.
    * @param {{
    *   url?: string | RegExp,
    *   method?: string,
@@ -171,7 +159,6 @@ class NetworkController extends EventEmitter {
   }
 
   /**
-   * Resolves a target entry ID by either requestId, URL string, or RegExp.
    * @param {string | { url?: string | RegExp, requestId?: string }} query
    * @returns {string}
    * @private
@@ -193,7 +180,6 @@ class NetworkController extends EventEmitter {
   }
 
   /**
-   * Reads the raw POST data / request payload via direct CDP call.
    * @param {string | { url?: string | RegExp, requestId?: string }} query
    * @returns {Promise<string | null>}
    */
@@ -218,7 +204,6 @@ class NetworkController extends EventEmitter {
   }
 
   /**
-   * Reads the response body of a request via direct CDP Network.getResponseBody.
    * @param {string | { url?: string | RegExp, requestId?: string }} query
    * @returns {Promise<{ body: string, base64Encoded: boolean, parsedJson?: object | null }>}
    */
@@ -326,7 +311,9 @@ class NetworkController extends EventEmitter {
     try {
       const { body, base64Encoded } = await this.getResponseBody(requestId);
       lines.push('', base64Encoded ? `[Base64 Encoded Binary: ${body.slice(0, 80)}...]` : body);
-    } catch {}
+    } catch (err) {
+      lines.push('', `[body unavailable: ${messageOf(err)}]`);
+    }
 
     return lines.join('\r\n');
   }
@@ -366,11 +353,8 @@ class NetworkController extends EventEmitter {
   }
 
   /**
-   * Searches response bodies for a string/regex. Hybrid: tries CDP's native
-   * Network.searchInResponseBody first (fast, works on renderer-buffered
-   * bodies); entries Chrome reports as unavailable — including everything
-   * stored by configureDurableMessages — fall back to getResponseBody plus a
-   * local match, so results stay consistent in both storage modes.
+   * Searches response bodies. Tries Chrome's native search first; bodies it cannot search (including durable-stored ones)
+   * are matched locally, so both storage modes give the same results.
    * @param {string | RegExp} query substring, or RegExp with /flags suffix
    * @param {{ requestId?: string }} [options] limit to one request
    * @returns {Promise<Array<{ requestId: string, url: string, matchLineNumbers: number[] }>>}
@@ -436,9 +420,8 @@ class NetworkController extends EventEmitter {
   }
 
   /**
-   * Retrieves cookies for the current page or specified URLs via CDP.
    * @param {Array<string>} [urls]
-   * @returns {Promise<Array<object>>}
+   * @returns {Promise<Array<import('devtools-protocol').Protocol.Network.Cookie>>}
    */
   async getCookies(urls) {
     const params = urls && urls.length > 0 ? { urls } : {};
@@ -446,18 +429,10 @@ class NetworkController extends EventEmitter {
     return res.cookies || [];
   }
 
-  /**
-   * Clears browser cache via CDP.
-   * @returns {Promise<void>}
-   */
   async clearCache() {
     await this._cdp.send('Network.clearBrowserCache');
   }
 
-  /**
-   * Clears browser cookies via CDP.
-   * @returns {Promise<void>}
-   */
   async clearCookies() {
     await this._cdp.send('Network.clearBrowserCookies');
   }
@@ -507,9 +482,8 @@ class NetworkController extends EventEmitter {
    * @private
    */
   /**
-   * Chrome reuses one requestId across a redirect chain, so an in-place update would
-   * overwrite the hop being audited with its own destination. Re-keys the finished hop
-   * so every hop stays addressable, and returns the index the next hop should carry.
+   * Chrome reuses one requestId across a redirect chain. Re-keys the finished hop so each hop keeps its own record,
+   * and the next hop gets a fresh one.
    * @returns {number}
    * @private
    */
@@ -534,6 +508,10 @@ class NetworkController extends EventEmitter {
     finishedHop.id = `${event.requestId}:redirect:${finishedHop.redirectIndex}`;
     this._entries.delete(event.requestId);
     this._entries.set(finishedHop.id, finishedHop);
+    // Chrome sends this hop's raw headers (Set-Cookie) after the next hop has started; see _onResponseExtraInfo.
+    const waiting = this._hopsAwaitingRaw.get(event.requestId) ?? [];
+    waiting.push(finishedHop);
+    this._hopsAwaitingRaw.set(event.requestId, waiting);
     this.emit('response', finishedHop);
 
     return finishedHop.redirectIndex + 1;
@@ -597,6 +575,16 @@ class NetworkController extends EventEmitter {
    */
   /** @param {import('devtools-protocol').Protocol.Network.ResponseReceivedExtraInfoEvent} event */
   _onResponseExtraInfo(event) {
+    // A redirect hop's extra info arrives after the next hop has started, and the requestId is shared.
+    // Without this, the 302's Set-Cookie would land on the final response, and the 302 would show none.
+    const waiting = this._hopsAwaitingRaw.get(event.requestId);
+    if (event.statusCode >= 300 && event.statusCode < 400 && waiting?.length) {
+      const hop = /** @type {TrafficEntry} */ (waiting.shift());
+      hop.rawResponseHeaders = event.headers;
+      hop.rawResponseHeadersText = event.headersText || null;
+      hop.rawStatusCode = event.statusCode;
+      return;
+    }
     const entry = this._getOrCreateEntry(event.requestId);
     entry.rawResponseHeaders = event.headers;
     entry.rawResponseHeadersText = event.headersText || null;

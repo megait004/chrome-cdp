@@ -19,9 +19,8 @@ function keyCodeOf(code) {
 }
 
 /**
- * Canvas and iframe access: list frames, click and hold keys at coordinates,
- * and read a canvas as an image. The DOM controller sees none of this: games
- * draw on <canvas> inside iframes, so there are no selectors to click.
+ * Canvas and iframe access. The DOM controller cannot see canvas drawings or iframe content, so this file works
+ * with coordinates and pixels.
  */
 /** What the page-side read returns: the PNG, or the browser's reason it failed. */
 /** @typedef {{ width: number, height: number, dataUrl: string } | { error: string }} CanvasRead */
@@ -70,20 +69,20 @@ class VisualController {
   }
 
   /**
-   * Makes WebGL canvases keep their drawing buffer, so `canvas()` can read them
-   * outside the frame that drew them. Without it a WebGL canvas reads back blank
-   * once the frame has been composited. Takes effect for documents created after
-   * this call, so the page has to reload (the CLI `canvas --preserve` does that).
+   * Keeps WebGL drawing buffers so `canvas()` can read them. Without it a WebGL canvas reads back blank once composited.
+   * Applies to documents created after this call, so the page reloads (`canvas --preserve` does that).
    */
   async preserveWebGL() {
     await this._page.evaluateOnNewDocument(() => {
       const original = HTMLCanvasElement.prototype.getContext;
-      const proto = /** @type {any} */ (HTMLCanvasElement.prototype);
-      /** @param {string} type @param {any} options */
-      proto.getContext = function (type, options) {
+      /** @type {(this: HTMLCanvasElement, type: string, options?: CanvasRenderingContext2DSettings & WebGLContextAttributes) => RenderingContext | null} */
+      const patched = function (type, options) {
         const webgl = type.startsWith('webgl');
         return original.call(this, type, webgl ? { ...options, preserveDrawingBuffer: true } : options);
       };
+      // note: getContext is overloaded per context id; the patch forwards every call to the original, so the
+      // cast only tells TypeScript that the single signature is compatible with all overloads.
+      HTMLCanvasElement.prototype.getContext = /** @type {typeof HTMLCanvasElement.prototype.getContext} */ (/** @type {unknown} */ (patched));
     });
   }
 
@@ -110,25 +109,22 @@ class VisualController {
     await new Promise((r) => setTimeout(r, 50));
     await this._cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at, buttons: pressed, clickCount });
     // A human press lasts ~100 ms. Games poll the button once per frame, so an instant release
-    // can be missed entirely (GameMaker's mouse_check_button_pressed never sees it).
+    // can be missed entirely when the app polls button state once per frame.
     await new Promise((r) => setTimeout(r, 100));
     await this._cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...at, buttons: 0, clickCount });
   }
 
   /**
-   * Waits for the page to go quiet before synthesized input. The first mouse press after a
-   * navigation is silently dropped while the page is still loading (measured: the first click
-   * on a freshly loaded game never lands, the second does). Capped at 3 s, because a game that
-   * polls the network never goes idle; then the input is sent anyway.
+   * Waits for the page to go quiet before input. The first press after a navigation is dropped while the page loads.
+   * Capped at 3 s, because a page that polls the network never goes quiet.
    */
   _settle() {
     return this._page.waitForNetworkIdle({ idleTime: 500, timeout: 3000 }).catch(() => {});
   }
 
   /**
-   * Holds a key down for `holdMs` (keyDown, wait, keyUp). Games read held keys
-   * from keydown/keyup, so a press-and-release tap is not enough for movement.
-   * Input goes to the focused element: click the game first so its frame has focus.
+   * Holds a key down for `holdMs`. Games read held keys from keydown and keyup, so a tap is not enough for movement.
+   * Input goes to the focused element.
    * @param {string} code KeyboardEvent.code, e.g. 'KeyW', 'Space', 'ArrowLeft'
    * @param {{ holdMs?: number }} [options] default 0 (a plain tap)
    */
@@ -147,10 +143,8 @@ class VisualController {
   }
 
   /**
-   * Reads one canvas as a PNG data URL, evaluated inside the frame that owns it.
-   * Fails with the browser's own error when the canvas is tainted (cross-origin
-   * images drawn on it). WebGL canvases return blank unless the app keeps its
-   * drawing buffer (preserveDrawingBuffer); no fallback is provided here.
+   * Reads one canvas as a PNG data URL inside the frame that owns it. Fails if cross-origin images taint the canvas.
+   * WebGL canvases read blank unless the app keeps its drawing buffer.
    * @param {{ frame?: string | RegExp, index?: number }} [options] index into the frame's canvases (default 0)
    * @returns {Promise<{ width: number, height: number, dataUrl: string }>}
    */

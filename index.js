@@ -16,7 +16,6 @@ const { webcrack } = require('webcrack');
 const astGrep = require('@ast-grep/napi');
 
 /**
- * Connects to an existing Chrome instance or launches one if not running.
  * @param {{
  *   port?: number,
  *   autoLaunch?: boolean,

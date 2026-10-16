@@ -1,7 +1,6 @@
 'use strict';
 
-// One place for every wait budget, so the trade-off between fast failure and
-// flaky success is tuned here, not hunted through call sites (Growing OO ch.27).
+// One place for every wait budget, so the trade-off between fast failure and flaky success is tuned here.
 module.exports = {
   // Per-CDP-call budget for puppeteer (ChromeClient.connect).
   PROTOCOL_TIMEOUT_MS: 30000,
