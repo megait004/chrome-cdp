@@ -1,6 +1,7 @@
 'use strict';
 
 const { WAIT_TIMEOUT_MS } = require("./timeouts");
+const { sleep } = require("./util");
 
 const DEFAULTS = { timeout: WAIT_TIMEOUT_MS, every: 300, min: 1 };
 
@@ -17,7 +18,6 @@ async function waitUntil(fn, options = {}) {
   const deadline = Date.now() + timeout;
   let observed = await fn();
 
-  // Sampling is sequential by design: each sample follows the previous one after a pause.
   while (!isReady(observed, min) && hasTimeForAnotherPoll(deadline, every)) {
     await sleep(every); // NOSONAR S9382
     observed = await fn(); // NOSONAR S9382
@@ -45,28 +45,34 @@ async function assertEventually(fn, options = {}) {
 /**
  * Collects emitted payloads instead of polling for their effects. Returns what it
  * collected, partial included.
- * @param {{ on: Function, off: Function }} emitter
+ * @template T
+ * @param {{ on: (event: string, fn: (payload: T) => void) => unknown, off: (event: string, fn: (payload: T) => void) => unknown }} emitter
  * @param {string} eventName
- * @param {{ timeout?: number, count?: number, where?: (payload: any) => boolean }} [options]
- * @returns {Promise<any[]>} Collected payloads, in arrival order.
+ * @param {{ timeout?: number, count?: number, where?: (payload: T) => boolean }} [options]
+ * @returns {Promise<T[]>} Collected payloads, in arrival order.
  */
 function waitForEvent(emitter, eventName, { timeout = WAIT_TIMEOUT_MS, count = 1, where } = {}) {
   return new Promise((resolve, reject) => {
-    /** @type {any[]} */
+    /** @type {T[]} */
     const collected = [];
     /** @type {ReturnType<typeof setTimeout> | undefined} */
     let timer;
 
-    /** @param {(v: any) => void} finish */
-    const settle = (finish) => (/** @type {any} */ value) => {
+    const done = () => {
       clearTimeout(timer);
       emitter.off(eventName, collect);
-      finish(value);
     };
-    const stopListening = settle(resolve);
-    const fail = settle(reject);
+    const stopListening = () => {
+      done();
+      resolve(collected);
+    };
+    /** @param {unknown} error */
+    const fail = (error) => {
+      done();
+      reject(error);
+    };
 
-    /** @param {any} payload */
+    /** @param {T} payload */
     function collect(payload) {
       try {
         if (where && !where(payload)) return;
@@ -75,11 +81,11 @@ function waitForEvent(emitter, eventName, { timeout = WAIT_TIMEOUT_MS, count = 1
         return;
       }
       collected.push(payload);
-      if (collected.length >= count) stopListening(collected);
+      if (collected.length >= count) stopListening();
     }
 
     emitter.on(eventName, collect);
-    timer = setTimeout(() => stopListening(collected), timeout);
+    timer = setTimeout(() => stopListening(), timeout);
   });
 }
 
@@ -101,10 +107,6 @@ function hasTimeForAnotherPoll(deadline, every) {
   return Date.now() + every < deadline;
 }
 
-/** @param {number} ms */
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /**
  * @param {unknown} observed
@@ -121,7 +123,8 @@ function describeFailedWait(observed, { timeout, min, describe }) {
 
 /** @param {unknown} value */
 function summarize(value) {
-  if (value === null || value === undefined) return String(value);
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
   const length = /** @type {{ length?: unknown }} */ (value).length;
   if (typeof length === 'number') return `length ${length}`;
   return typeof value;
