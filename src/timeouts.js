@@ -16,7 +16,7 @@ module.exports = {
   CLI_DEFAULT_WAIT_S: 5,
   // Default budget for waitUntil / assertEventually / waitForEvent.
   WAIT_TIMEOUT_MS: 20000,
-  // Budget for Performance.stopTrace to stream the trace back.
+  // Budget for Tracing.end to stream the trace back.
   TRACE_STOP_TIMEOUT_MS: 30000,
   // Budgets for Chromium to apply a minimize / restore of an occluded window.
   WINDOW_HIDE_WAIT_MS: 1000,

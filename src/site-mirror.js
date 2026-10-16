@@ -512,7 +512,7 @@ async function finalize(client, runDir, requestedUrl, navigationError) {
   // note: an error page (chrome-error://) yields no value, so undefined is written as null, not thrown on.
   const write = (name, data) => fs.writeFileSync(path.join(runDir, name), typeof data === 'string' ? data : JSON.stringify(data ?? null, null, 2));
 
-  const cookies = await root.send('Network.getAllCookies').then((r) => r.cookies ?? []).catch((err) => ({ error: messageOf(err) }));
+  const cookies = await root.send('Storage.getCookies').then((r) => r.cookies ?? []).catch((err) => ({ error: messageOf(err) }));
   write('cookies.json', cookies);
   const storage = await root.send('Runtime.evaluate', { expression: STORAGE_JS, returnByValue: true })
     .then((r) => /** @type {string | undefined} */ (r.result.value) ?? '{}')

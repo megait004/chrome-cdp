@@ -55,6 +55,10 @@ Work the way a person does: look, act once, read what changed, then decide.
 | Run JavaScript in the page or an iframe | `eval [url] [--frame <part>] <expr>` or `eval --file script.js` |
 | Record HTTP and WebSocket traffic | `traffic [url] [--bodies] [--wait S] [--headers] [--json]` |
 | Find and reverse a script bundle | `search-sources`, `download-bundle`, `deobfuscate`, `unpack`, `ast-search` |
+| Find code the page created at runtime (eval, Function) | `vm-scripts` lists them; `find-function <id> <name>` finds where a function is defined |
+| Find what makes the page slow to render | `layout [url] [--wait S]`: style, layout, pre-paint and paint with the script that forced each one |
+| Map which handlers respond to events, and what runs | `events [url]` lists listeners by type and handler location; `profile [url] [--wait S]` shows the functions that ran and their callers |
+| Reverse a payload the page builds at runtime | `catch-script <url> --min-bytes N [--break-line N] [--eval <expr>]`: pauses before that script runs, shows the stack and the call site that built it, then breaks inside it and reads variables; `break <scriptId> <line>` for a later stop |
 | Pause at a line | `break [url] <query> <line> --trigger "<js>"` |
 | Release a page paused by another command | `resume` |
 | Forms, storage, event listeners | `dump-forms`, `dump-storage`, `listeners` |
@@ -116,7 +120,7 @@ The library's `connect()` launches Chrome if none is running; the CLI does not, 
 | `No frame at index N` | Index past the frame list | `node cli.js frames` |
 | WebGL canvas reads blank | Drawing buffer not preserved | `canvas --preserve` (reloads the tab) |
 | Page opens `chrome://newtab` and reads empty | `connect()` reuses tab 0 and resets `chrome://` to `about:blank` | Expected: `goto()` your target |
-| `eval` hangs about 30 s, then `ProtocolError` | Synchronous `XMLHttpRequest` (or another blocking call) in the page. Chrome blocks the page's JS thread, so CDP times out | Use `await fetch(...)` in an async expression; do not raise the timeout to hide it |
+| `eval` hangs about 10 s, then `ProtocolError` | Synchronous `XMLHttpRequest` (or another blocking call) in the page. Chrome blocks the page's JS thread, so CDP times out | Use `await fetch(...)` in an async expression; do not raise the timeout to hide it |
 | Hangs about 30 s, then `ProtocolError` (other) | A CDP call exceeded the protocol timeout | `connect({ protocolTimeout: 120000 })` for heavy work |
 | `Page.captureScreenshot timed out` (raw CDP) | The window is **minimized**; compositing is suspended | `Browser.setWindowBounds({ windowId, bounds: { windowState: 'normal' } })` |
 

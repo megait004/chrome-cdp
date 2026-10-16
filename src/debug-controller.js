@@ -63,6 +63,23 @@ function readPauseMarker() {
   return null;
 }
 
+/**
+ * One scope value as text: a string keeps its length (a string here can be the whole decoded payload),
+ * other primitives go by value, objects by their description.
+ * @param {import('devtools-protocol').Protocol.Runtime.RemoteObject | undefined} remote
+ * @param {number} [maxChars]
+ * @returns {{ value: string, chars?: number }}
+ */
+function describeRemote(remote, maxChars = 160) {
+  if (!remote) return { value: '(no value)' };
+  if (typeof remote.value === 'string') {
+    const chars = remote.value.length;
+    return { value: chars > maxChars ? `${JSON.stringify(remote.value.slice(0, maxChars))}... (${chars} chars)` : JSON.stringify(remote.value), chars };
+  }
+  if (remote.value !== undefined) return { value: JSON.stringify(remote.value) };
+  return { value: (remote.description ?? remote.type).split('\n')[0].slice(0, maxChars) };
+}
+
 class DebugController extends EventEmitter {
   /** @param {import('puppeteer-core').CDPSession} cdp */
   constructor(cdp) {
@@ -161,6 +178,56 @@ class DebugController extends EventEmitter {
     const result = await this._cdp.send('Debugger.setBreakpointByUrl', params);
     this._breakpoints.add(result.breakpointId);
     return result;
+  }
+  /**
+   * Breakpoint inside one script, addressed by scriptId. This is the only way to break in a script that
+   * has no URL (code the page created with eval or Function): URL matching cannot reach it.
+   * @param {string} scriptId
+   * @param {number} lineNumber 0-based line of that script's own source
+   * @param {number} [columnNumber]
+   * @param {string} [condition]
+   */
+  async setBreakpointAtLocation(scriptId, lineNumber, columnNumber = 0, condition) {
+    if (!scriptId || !Number.isInteger(lineNumber) || lineNumber < 0) throw new TypeError('scriptId and non-negative lineNumber are required');
+    /** @type {import('devtools-protocol').Protocol.Debugger.SetBreakpointRequest} */
+    const params = { location: { scriptId, lineNumber, columnNumber } };
+    if (condition) params.condition = condition;
+    const result = await this._cdp.send('Debugger.setBreakpoint', params);
+    this._breakpoints.add(result.breakpointId);
+    return result;
+  }
+  /**
+   * Pauses before a script runs. Chrome attaches this breakpoint to each script as it is parsed
+   * (V8DebuggerAgentImpl::setScriptInstrumentationBreakpointIfNeeded), so it also covers code created
+   * later by eval or Function — arm it before that code is created. The pause carries reason
+   * 'instrumentation', `data.scriptId` of the script about to run, and a stack whose first frame is that
+   * script and whose lower frames are the code that created it.
+   * @param {'beforeScriptExecution' | 'beforeScriptWithSourceMapExecution'} [instrumentation]
+   */
+  async setInstrumentationBreakpoint(instrumentation = 'beforeScriptExecution') {
+    const result = await this._cdp.send('Debugger.setInstrumentationBreakpoint', { instrumentation });
+    this._breakpoints.add(result.breakpointId);
+    return result;
+  }
+  /**
+   * Named values of a paused call frame's scopes, as text. Only readable while paused.
+   * @param {import('devtools-protocol').Protocol.Debugger.CallFrame} callFrame
+   * @param {{ limit?: number, includeGlobals?: boolean }} [options]
+   * @returns {Promise<Array<{ scope: string, name: string, value: string, chars?: number }>>}
+   */
+  async getScopeValues(callFrame, options = {}) {
+    const limit = options.limit ?? 40;
+    const values = [];
+    for (const scope of callFrame.scopeChain ?? []) {
+      if (!options.includeGlobals && (scope.type === 'global' || scope.type === 'with')) continue;
+      const objectId = scope.object?.objectId;
+      if (!objectId) continue;
+      const properties = await this._cdp.send('Runtime.getProperties', { objectId, ownProperties: true });
+      for (const property of properties.result.slice(0, limit)) {
+        values.push({ scope: scope.type, name: property.name, ...describeRemote(property.value) });
+      }
+    }
+    return values;
   }
   pause() { return this._cdp.send('Debugger.pause'); }
   resume() { return this._cdp.send('Debugger.resume'); }

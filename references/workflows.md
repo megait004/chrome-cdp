@@ -26,11 +26,26 @@ Frames often arrive only after a user action. Connect, interact, then wait, then
 ### Bundle
 
 ```javascript
+const fs = require('fs');
+const { parse, Lang } = require('@ast-grep/napi');
 const [hit] = await client.sources.searchInSources(/jwt_secret|X-Signature/i);
-await client.sources.deobfuscateBundle(hit.scriptId);     // webcrack; search the clean code
-await client.sources.unpackBundle(hit.scriptId, './.tmp/modules/');
-await client.sources.searchAst(hit.scriptId, 'fetch($URL, { $$$OPTS })');
+const { code } = await client.sources.deobfuscateBundle(hit.scriptId);   // webcrack output
+fs.writeFileSync('.tmp/bundle.clean.js', code);
+// Structural search on the clean text. On the raw bundle a call behind a string table matches nothing.
+parse(Lang.JavaScript, fs.readFileSync('.tmp/bundle.clean.js', 'utf8')).root().findAll('fetch($URL, { $$$OPTS })').map((h) => h.text());
 ```
+
+For webpack or browserify bundles, `client.sources.unpackBundle(hit.scriptId, './.tmp/modules/')` splits them into modules first.
+
+### Script with no URL
+
+A script the page creates at runtime (`eval`, `Function`, a decoded payload) has `url: ''`. CDP still lists it with a scriptId; DevTools names it `VM<id>`.
+
+- URL substring searches never match it. Content search does: `search-sources` covers every loaded script, including empty-URL ones.
+- To list them: `node cli.js vm-scripts`. To find a function in one of them: `node cli.js find-function <scriptId> <name>`. The API equivalents are `client.sources.listDynamicScripts()` and `findFunction()`. If you write your own script, call `disconnect()` in a `finally`; an error thrown before it leaves the process waiting until the timeout.
+- The scriptId changes after navigation. List again before you use an id.
+- A zero result means "not in this copy", not "not there". Search the other form of the text: the raw source keeps `(!1)` where the cleaned copy has `false`.
+- Decoded is not readable. Before you describe the code, count a few common markers in the file (calls, property names, event listeners). If they are absent, the text is still a string table.
 
 ### Mirror a site and index its code
 

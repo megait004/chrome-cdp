@@ -358,7 +358,11 @@ class DOMController {
    * @param {string} [target='window'] - CSS selector or 'window' or 'document'
    * @returns {Promise<Array<Pick<import('devtools-protocol').Protocol.DOMDebugger.EventListener, 'type' | 'useCapture' | 'passive' | 'once' | 'scriptId' | 'lineNumber' | 'columnNumber'> & { handlerDescription: string | null }>>}
    */
-  async getEventListeners(target = 'window') {
+  /**
+   * @param {string} [target] 'window', 'document', or a selector
+   * @param {{ pierce?: boolean }} [options] pierce also reports listeners inside iframes and shadow roots
+   */
+  async getEventListeners(target = 'window', options = {}) {
     if (!this._cdp) {
       throw new Error('CDPSession is required to audit event listeners via DOMDebugger');
     }
@@ -381,9 +385,11 @@ class DOMController {
       throw new Error(`Target not found for event listeners: ${target}`);
     }
 
+    // depth -1 covers the whole subtree under the object, so one call on the document lists every element's listeners
     const response = await this._cdp.send('DOMDebugger.getEventListeners', {
       objectId: result.objectId,
       depth: -1,
+      pierce: Boolean(options.pierce),
     });
 
     return (response.listeners || []).map((l) => ({

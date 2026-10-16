@@ -88,6 +88,22 @@ Commands:
                                 Unpack Webpack/Browserify modules into folder
   ast-search [url] <queryOrId> <pattern>
                                 Structural AST search using ast-grep (e.g. 'fetch($U, $$$)')
+  vm-scripts [url]              List scripts with no URL (created by eval/Function):
+                                scriptId, start line, line count, and the first 100 characters
+  find-function [url] <queryOrId> <name>
+                                Lines where a function is defined ("function NAME(" or "NAME = function"),
+                                each cut to 300 characters
+  layout [url] [--wait S]       Record style, layout, pre-paint and paint for S seconds (default 5; interact
+                                meanwhile) and report totals and the script location that caused each stage
+  events [url]                  Every event listener registered on the window and the document tree
+                                (and iframes), grouped by event type and handler location
+  catch-script [url] [--min-bytes N] [--break-line N] [--break-col N] [--eval <expr>] [--frame N] [--timeout S]
+                                Pause before a script runs, report the script and the stack, then (with
+                                --break-line) stop inside that script, list the variables of the frame and of
+                                its caller, and run --eval (--frame picks the frame, default 0). Reaches code
+                                with no URL that the break command cannot name. --min-bytes skips small scripts
+  profile [url] [--wait S]      CPU profile for S seconds (default 5; interact meanwhile): functions by
+                                self time, with the two callers that called them most
   mirror start <url> [outDir]   Load the URL with the cache off and start recording in the
                                 background: every request and response (raw headers, cookies
                                 included), WebSocket frames, and bodies, until you stop it.
@@ -335,7 +351,45 @@ const bundles = createBundleCommands({
   isHttpUrl,
   T,
 });
-const { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch } = bundles;
+const { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch, cmdVmScripts, cmdFindFunction } = bundles;
+
+const { createLayoutCommands } = require('./src/commands/layout');
+const { cmdLayout } = createLayoutCommands({
+  attach: async (port) => {
+    const client = await attach(port);
+    activeClient = client;
+    return client;
+  },
+  emit,
+  release,
+  isHttpUrl,
+  T,
+});
+
+const { createRuntimeCommands } = require('./src/commands/runtime');
+const { createRevealCommands } = require('./src/commands/reveal');
+const { cmdCatchScript } = createRevealCommands({
+  attach: async (port) => {
+    const client = await attach(port);
+    activeClient = client;
+    return client;
+  },
+  emit,
+  release,
+  isHttpUrl,
+  T,
+});
+const { cmdEvents, cmdProfile } = createRuntimeCommands({
+  attach: async (port) => {
+    const client = await attach(port);
+    activeClient = client;
+    return client;
+  },
+  emit,
+  release,
+  isHttpUrl,
+  T,
+});
 
 /**
  * `mirror start <url>` starts a detached recorder that keeps running while you interact with the tab;
@@ -578,12 +632,18 @@ function parseBreakArgs(args) {
 /**
  * Sets the breakpoint on the script the query names. The line is given script-relative, as the agent reads it.
  * @param {Client} client
- * @param {string} scriptQuery
+ * @param {string} scriptQuery a scriptId (all digits), or a URL or URL substring
  * @param {number} line
  * @param {number} col
  * @param {string | null} condition
  */
 async function setScriptBreakpoint(client, scriptQuery, line, col, condition) {
+  // A bare number is a scriptId: the only way to break inside a script with no URL (eval, Function, a
+  // decoded payload). URL matching cannot name such a script.
+  if (/^\d+$/.test(scriptQuery)) {
+    const result = await client.debug.setBreakpointAtLocation(scriptQuery, line, col, condition || undefined);
+    return { bp: { breakpointId: result.breakpointId, locations: [result.actualLocation] }, targetUrl: `scriptId ${scriptQuery}`, matchedScripts: 1 };
+  }
   // Resolve the query to a concrete script URL when possible: exact URLs resolve breakpoints immediately
   // (locations[] non-empty); an unmatched pattern still registers a logical breakpoint that fires on future loads.
   const known = client.sources.getScripts({ url: scriptQuery });
@@ -1207,6 +1267,12 @@ async function main() {
     case 'unpack': await cmdUnpack(ctx); break;
 
     case 'ast-search': await cmdAstSearch(ctx); break;
+    case 'vm-scripts': await cmdVmScripts(ctx); break;
+    case 'find-function': await cmdFindFunction(ctx); break;
+    case 'layout': await cmdLayout(ctx); break;
+    case 'catch-script': await cmdCatchScript(ctx); break;
+    case 'events': await cmdEvents(ctx); break;
+    case 'profile': await cmdProfile(ctx); break;
 
     case 'mirror': await cmdMirror(ctx); break;
     case 'mirror-run': await cmdMirrorRun(ctx); break;

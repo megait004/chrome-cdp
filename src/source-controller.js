@@ -6,12 +6,12 @@ const EventEmitter = require('node:events');
 const { webcrack } = require('webcrack');
 const { parse, Lang } = require('@ast-grep/napi');
 const matchesQuery = require('./match-query');
-const { safeDecode } = require('./util');
+const { safeDecode, messageOf } = require('./util');
 
 
 /**
  * A loaded script, as Debugger.scriptParsed reports it, plus the fields this controller adds.
- * @typedef {Pick<import('devtools-protocol').Protocol.Debugger.ScriptParsedEvent, 'scriptId' | 'startLine' | 'startColumn' | 'endLine' | 'endColumn' | 'hash' | 'sourceMapURL'> & { url: string }} ScriptInfo
+ * @typedef {Pick<import('devtools-protocol').Protocol.Debugger.ScriptParsedEvent, 'scriptId' | 'startLine' | 'startColumn' | 'endLine' | 'endColumn' | 'hash' | 'sourceMapURL' | 'length'> & { url: string }} ScriptInfo
  */
 
 /**
@@ -79,7 +79,7 @@ class SourceController extends EventEmitter {
   getScripts(filter = {}) {
     const scripts = Array.from(this._scripts.values());
     return scripts.filter((s) => {
-      // Inline <script> blocks have an empty url and are app code: keep them. Only browser internals go.
+      // Keep runtime scripts (empty url); only browser internals go.
       if (filter.excludeInternal && /^(pptr:|chrome-extension:)/.test(s.url)) {
         return false;
       }
@@ -89,6 +89,42 @@ class SourceController extends EventEmitter {
       }
       return true;
     });
+  }
+
+  /**
+   * Scripts with an empty URL: created at runtime (eval, Function). Inline HTML blocks carry the page URL,
+   * so they are not listed here. `length` comes from Debugger.scriptParsed, so it costs no transfer.
+   * @returns {Promise<Array<{ scriptId: string, startLine: number, lines: number, length: number | null, head: string | null, error?: string }>>}
+   */
+  async listDynamicScripts() {
+    const rows = this.getScripts().filter((s) => !s.url);
+    return Promise.all(rows.map(async (s) => {
+      const base = { scriptId: s.scriptId, startLine: s.startLine, lines: s.endLine - s.startLine + 1, length: s.length ?? null };
+      try {
+        const { source } = await this.getScriptSource(s.scriptId);
+        return { ...base, head: source.slice(0, 100).replace(/\s+/g, ' ') };
+      } catch (err) {
+        // A script can be unreadable (WebAssembly, or a context that was cleared); report that per row
+        // instead of failing the whole listing.
+        return { ...base, head: null, error: messageOf(err) };
+      }
+    }));
+  }
+
+  /**
+   * Lines where a function is defined in one script: `function NAME(` or `NAME = function`.
+   * A match is text, not a parse: a string or a comment with the same shape also matches.
+   * @param {string} scriptIdOrUrl
+   * @param {string} name
+   * @returns {Promise<Array<{ lineNumber: number, lineContent: string }>>}
+   */
+  async findFunction(scriptIdOrUrl, name) {
+    if (!name) throw new TypeError('Function name must not be empty');
+    const scriptId = this._resolveScriptId(scriptIdOrUrl);
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const query = `(?<![\\w$])(function\\s+${escaped}\\s*\\(|${escaped}\\s*=\\s*function\\b)`;
+    const response = await this._cdp.send('Debugger.searchInContent', { scriptId, query, caseSensitive: true, isRegex: true });
+    return (response.result ?? []).map((m) => ({ lineNumber: m.lineNumber, lineContent: m.lineContent }));
   }
 
   /**
@@ -330,6 +366,7 @@ class SourceController extends EventEmitter {
       endColumn: script.endColumn,
       hash: script.hash,
       sourceMapURL: script.sourceMapURL || '',
+      length: script.length,
     };
     this._scripts.set(script.scriptId, entry);
     this.emit('scriptParsed', entry);

@@ -14,7 +14,26 @@ class PerformanceController {
     this._page = page;
     this._cdp = cdp;
     this._tracing = false;
+    this._profiling = false;
     this._metricsEnabled = false;
+  }
+  /** @param {{ interval?: number }} [options] sampling interval in microseconds (default 1000) */
+  async startProfile(options = {}) {
+    if (this._profiling) throw new Error('A CPU profile is already running');
+    await this._cdp.send('Profiler.enable');
+    await this._cdp.send('Profiler.setSamplingInterval', { interval: options.interval ?? 1000 });
+    await this._cdp.send('Profiler.start');
+    this._profiling = true;
+  }
+  /** @returns {Promise<import('devtools-protocol').Protocol.Profiler.Profile>} */
+  async stopProfile() {
+    if (!this._profiling) throw new Error('No CPU profile is running');
+    try {
+      const { profile } = await this._cdp.send('Profiler.stop');
+      return profile;
+    } finally {
+      this._profiling = false;
+    }
   }
   async metrics() {
     if (!this._metricsEnabled) {

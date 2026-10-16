@@ -127,7 +127,41 @@ function createBundleCommands({ attach, emit, release, isHttpUrl, T }) {
     await release(client);
   }
 
-  return { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch };
+  /** @param {Ctx} ctx */
+  async function cmdVmScripts({ args, port, outFile }) {
+    const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+    const client = await attach(port);
+    if (url) await client.goto(url, { waitUntil: 'networkidle2', timeout: T.CLI_NAV_TIMEOUT_MS });
+
+    const scripts = (await client.sources.listDynamicScripts()).sort((a, b) => b.lines - a.lines);
+    await emit({ count: scripts.length, scripts }, outFile);
+
+    await release(client);
+  }
+
+  /** @param {Ctx} ctx */
+  async function cmdFindFunction({ args, port, outFile }) {
+    const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+    const queryOrId = url ? args[2] : args[1];
+    const name = url ? args[3] : args[2];
+    if (!queryOrId || !name) {
+      throw new Error('Usage: node cli.js find-function [url] <queryOrId> <name>');
+    }
+
+    const client = await attach(port);
+    if (url) await client.goto(url);
+
+    // Minified bundles put a whole module on one line, so cut each line for the terminal; eval reads the rest.
+    const matches = (await client.sources.findFunction(queryOrId, name)).map((m) => ({
+      lineNumber: m.lineNumber,
+      lineContent: m.lineContent.length > 300 ? `${m.lineContent.slice(0, 300)}…` : m.lineContent,
+    }));
+    await emit({ name, count: matches.length, matches }, outFile);
+
+    await release(client);
+  }
+
+  return { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch, cmdVmScripts, cmdFindFunction };
 }
 
 module.exports = { createBundleCommands };
