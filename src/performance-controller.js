@@ -1,9 +1,14 @@
 'use strict';
 
 const { performance } = require('node:perf_hooks');
+const { TRACE_STOP_TIMEOUT_MS } = require('./timeouts');
 
 /** Lightweight timing, metrics and trace capture for bottleneck analysis. */
 class PerformanceController {
+  /**
+   * @param {import('puppeteer-core').Page} page
+   * @param {import('puppeteer-core').CDPSession} cdp
+   */
   constructor(page, cdp) {
     if (!page) throw new TypeError('Page instance is required for PerformanceController');
     if (!cdp) throw new TypeError('CDPSession is required for PerformanceController');
@@ -18,8 +23,9 @@ class PerformanceController {
       this._metricsEnabled = true;
     }
     const result = await this._cdp.send('Performance.getMetrics');
-    return Object.fromEntries((result.metrics || []).map((metric) => [metric.name, metric.value]));
+    return Object.fromEntries((result.metrics || []).map((/** @type {{ name: string, value: number }} */ metric) => [metric.name, metric.value]));
   }
+  /** @param {{ categories?: string }} [options] */
   async startTrace(options = {}) {
     if (this._tracing) throw new Error('A performance trace is already running');
     // Enables the Performance domain up front so counters are already ticking when the
@@ -31,19 +37,22 @@ class PerformanceController {
     });
     this._tracing = true;
   }
+  /** @param {{ timeout?: number }} [options] */
   async stopTrace(options = {}) {
     if (!this._tracing) throw new Error('No performance trace is running');
-    const timeout = options.timeout ?? 30000;
+    const timeout = options.timeout ?? TRACE_STOP_TIMEOUT_MS;
     let stream;
     try {
       stream = await new Promise((resolve, reject) => {
+        /** @type {ReturnType<typeof setTimeout> | undefined} */
         let timer;
-        const settle = (finish) => (value) => {
+        /** @param {(v: any) => void} finish */
+        const settle = (finish) => (/** @type {any} */ value) => {
           clearTimeout(timer);
           this._cdp.off('Tracing.tracingComplete', onComplete);
           finish(value);
         };
-        const onComplete = (event) => settle(resolve)(event.stream);
+        const onComplete = (/** @type {import('devtools-protocol').Protocol.Tracing.TracingCompleteEvent} */ event) => settle(resolve)(event.stream);
         const fail = settle(reject);
         this._cdp.on('Tracing.tracingComplete', onComplete);
         timer = setTimeout(
@@ -69,6 +78,7 @@ class PerformanceController {
     }
     return trace;
   }
+  /** @param {(...args: any[]) => any} fn @param {...any} args */
   async measure(fn, ...args) {
     const before = await this.metrics();
     const started = performance.now();

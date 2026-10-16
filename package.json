@@ -1,45 +1,54 @@
 {
-  "name": "chrome-cdp",
-  "version": "1.0.0",
-  "description": "inspect live dom, capture raw websocket traffic, and reverse obfuscated bundles via cdp",
-  "main": "index.js",
-  "bin": {
-    "chrome-cdp": "./cli.js"
-  },
-  "scripts": {
-    "start": "node cdp.js",
-    "test": "node --test"
-  },
-  "keywords": [
-    "chrome",
-    "cdp",
-    "chrome-devtools-protocol",
-    "puppeteer",
-    "reverse-engineering",
-    "security",
-    "devtools",
-    "dom-auditing"
-  ],
-  "author": "megait004",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/megait004/chrome-cdp.git"
-  },
-  "bugs": {
-    "url": "https://github.com/megait004/chrome-cdp/issues"
-  },
-  "homepage": "https://github.com/megait004/chrome-cdp#readme",
-  "license": "ISC",
-  "dependencies": {
-    "@ast-grep/napi": "0.45.3",
-    "@mozilla/readability": "0.6.0",
-    "cheerio": "1.2.0",
-    "jsdom": "30.0.1",
-    "puppeteer-core": "25.10.0",
-    "puppeteer-extra": "3.3.6",
-    "puppeteer-extra-plugin-stealth": "2.11.2",
-    "turndown": "7.2.4",
-    "turndown-plugin-gfm": "1.0.2",
-    "webcrack": "2.16.0"
-  }
+	"name": "chrome-cdp",
+	"version": "1.0.0",
+	"description": "inspect live dom, capture raw websocket traffic, and reverse obfuscated bundles via cdp",
+	"main": "index.js",
+	"bin": {
+		"chrome-cdp": "./cli.js"
+	},
+	"scripts": {
+		"start": "node cdp.js",
+		"clean": "node cli.js clean"
+	},
+	"keywords": [
+		"chrome",
+		"cdp",
+		"chrome-devtools-protocol",
+		"puppeteer",
+		"reverse-engineering",
+		"security",
+		"devtools",
+		"dom-auditing"
+	],
+	"author": "megait004",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/megait004/chrome-cdp.git"
+	},
+	"bugs": {
+		"url": "https://github.com/megait004/chrome-cdp/issues"
+	},
+	"homepage": "https://github.com/megait004/chrome-cdp#readme",
+	"license": "ISC",
+	"dependencies": {
+		"@ast-grep/napi": "0.45.3",
+		"@mozilla/readability": "0.6.0",
+		"cheerio": "1.2.0",
+		"jsdom": "30.0.1",
+		"puppeteer-core": "25.10.0",
+		"puppeteer-extra": "3.3.6",
+		"puppeteer-extra-plugin-stealth": "2.11.2",
+		"turndown": "7.2.4",
+		"turndown-plugin-gfm": "1.0.2",
+		"webcrack": "2.16.0"
+	},
+	"allowScripts": {
+		"isolated-vm@6.2.0": true
+	},
+	"devDependencies": {
+		"@types/jsdom": "^30.0.0",
+		"@types/node": "26.6.5",
+		"@types/turndown": "^5.0.6",
+		"devtools-protocol": "0.0.1666840"
+	}
 }

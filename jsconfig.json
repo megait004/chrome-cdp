@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "noEmit": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "lib": [
+      "es2022",
+      "dom",
+      "dom.iterable"
+    ],
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "types": [
+      "node"
+    ],
+    "maxNodeModuleJsDepth": 0
+  },
+  "include": [
+    "cli.js",
+    "cdp.js",
+    "index.js",
+    "src/**/*.js",
+    "src/types/**/*.d.ts"
+  ]
+}

@@ -1,18 +1,22 @@
 'use strict';
 
 const cheerio = require('cheerio');
+const { WINDOW_HIDE_WAIT_MS, WINDOW_SHOW_WAIT_MS } = require('./timeouts');
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 const TurndownService = require('turndown');
 const { gfm } = require('turndown-plugin-gfm');
+
+/** @typedef {import('./types/snapshot').SnapshotElement} SnapshotElement */
+/** @typedef {import('./types/snapshot').InteractiveSnapshot} InteractiveSnapshot */
 
 /**
  * Controller for DOM queries, interactions, security inspections, and content extraction.
  */
 class DOMController {
   /**
-   * @param {import('puppeteer').Page} page
-   * @param {import('puppeteer').CDPSession} [cdpSession]
+   * @param {import('puppeteer-core').Page} page
+   * @param {import('puppeteer-core').CDPSession | null} [cdpSession]
    */
   constructor(page, cdpSession = null) {
     if (!page) throw new TypeError('Page instance is required for DOMController');
@@ -25,38 +29,41 @@ class DOMController {
    * window is covered or on an unshown virtual desktop (`visibilityState:
    * 'hidden'` even with `hasFocus()` true), Chromium silently drops
    * synthesized keyboard input — keyboard.type() produces no events at all.
-   * A minimized→normal bounds dance forces real window activation (measured:
-   * hidden→visible and keys flow; bringToFront and setWebLifecycleState do
-   * not help).
+   * A minimized→normal bounds dance forces real window activation. Needs a
+   * visible window, so no automated test covers it; bringToFront and
+   * setWebLifecycleState were reported not to help.
    * @returns {Promise<void>}
    */
-  async _ensureVisible() {
+  async ensureVisible() {
     let vis;
     try {
       vis = await this._page.evaluate(() => document.visibilityState);
     } catch { return; } // detached context — nothing to revive
     if (vis === 'visible' || !this._cdp) return;
+    // Poll for the state we asked for instead of fixed sleeps: returns as soon as
+    // Chromium has applied the bounds change, and gives up after `ms` (best effort).
+    const awaitState = async (/** @type {string} */ want, /** @type {number} */ ms) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        // Sampling loop: must observe one state before deciding whether to wait again.
+        const state = await this._page.evaluate(() => document.visibilityState).catch(() => null); // NOSONAR S9382
+        if (state === want) return;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    };
     try {
       const { windowId } = await this._cdp.send('Browser.getWindowForTarget');
       await this._cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
-      await new Promise((r) => setTimeout(r, 300));
+      await awaitState('hidden', WINDOW_HIDE_WAIT_MS);
       await this._cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
-      await new Promise((r) => setTimeout(r, 500));
+      await awaitState('visible', WINDOW_SHOW_WAIT_MS);
     } catch {} // best effort — the typed text may land in a visible case only
-  }
-
-  /**
-   * Sets or updates active CDP session.
-   * @param {import('puppeteer').CDPSession} cdpSession
-   */
-  setCDPSession(cdpSession) {
-    this._cdp = cdpSession;
   }
 
   /**
    * Finds a single element matching selector.
    * @param {string} selector
-   * @returns {Promise<import('puppeteer').ElementHandle | null>}
+   * @returns {Promise<import('puppeteer-core').ElementHandle | null>}
    */
   async $(selector) {
     return this._page.$(selector);
@@ -67,17 +74,18 @@ class DOMController {
    * eyes. Read this before acting and after every action, so selectors are
    * picked from what the page actually shows, not from memory.
    * @param {string} [selector] restrict the scan to a subtree
-   * @returns {Promise<{ url: string, readyState: string, count: number, elements: Array<object> }>}
+   * @param {import('puppeteer-core').Frame | import('puppeteer-core').Page} [frame] scan this frame instead of the page (iframes, games)
+   * @returns {Promise<InteractiveSnapshot | null>}
    */
-  async interactiveSnapshot(selector) {
-    return this._page.evaluate((scope) => {
+  async interactiveSnapshot(selector, frame = this._page) {
+    return frame.evaluate((scope) => {
       const SELECTOR = 'a, button, input, select, textarea, [role=button], [role=link], [role=tab], [onclick], summary, label[for]';
       const root = scope ? document.querySelector(scope) : document;
       if (!root) return null;
-      const clean = (s, n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+      const clean = (/** @type {string | null | undefined} */ s, /** @type {number} */ n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
       const seen = new Set();
       const elements = [];
-      for (const el of root.querySelectorAll(SELECTOR)) {
+      for (const el of /** @type {NodeListOf<any>} */ (root.querySelectorAll(SELECTOR))) {
         const cs = getComputedStyle(el);
         if (cs.display === 'none' || cs.visibility === 'hidden') continue;
         const rect = el.getBoundingClientRect();
@@ -112,10 +120,10 @@ class DOMController {
   async clickByText(text) {
     return this._page.evaluate((target) => {
       const SELECTOR = 'a, button, [role=button], [role=tab], [onclick], summary, input[type=submit], input[type=button]';
-      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const norm = (/** @type {string | null | undefined} */ s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
       const want = norm(target);
       let exact = null, partial = null;
-      for (const el of document.querySelectorAll(SELECTOR)) {
+      for (const el of /** @type {NodeListOf<any>} */ (document.querySelectorAll(SELECTOR))) {
         const cs = getComputedStyle(el);
         if (cs.display === 'none' || cs.visibility === 'hidden') continue;
         const t = norm(el.innerText || el.value);
@@ -132,18 +140,18 @@ class DOMController {
 
   /**
    * Presses a keyboard key on the focused element (Enter, Tab, Escape, ...).
-   * @param {string} key
+   * @param {import('puppeteer-core').KeyInput} key
    * @returns {Promise<void>}
    */
   async press(key) {
-    await this._ensureVisible(); // occluded windows swallow synthesized keys
+    await this.ensureVisible(); // occluded windows swallow synthesized keys
     await this._page.keyboard.press(key);
   }
 
   /**
    * Finds all elements matching selector.
    * @param {string} selector
-   * @returns {Promise<Array<import('puppeteer').ElementHandle>>}
+   * @returns {Promise<Array<import('puppeteer-core').ElementHandle>>}
    */
   async $$(selector) {
     return this._page.$$(selector);
@@ -153,12 +161,13 @@ class DOMController {
    * Clicks an element matching selector.
    * Uses direct DOM focus and click to prevent IntersectionObserver hang in background/minimized windows.
    * @param {string} selector
-   * @param {import('puppeteer').ClickOptions} [options]
+   * @param {{ timeout?: number } & import('puppeteer-core').ClickOptions} [options]
+   *   timeout (ms) bounds the wait for the element; the rest goes to the page.click fallback.
    */
-  async click(selector, options) {
-    await this._page.waitForSelector(selector);
+  async click(selector, { timeout, ...clickOptions } = {}) {
+    await this._page.waitForSelector(selector, { timeout });
     try {
-      await this._page.$eval(selector, (el) => {
+      await this._page.$eval(selector, (/** @type {any} */ el) => {
         if (typeof el.scrollIntoView === 'function') {
           el.scrollIntoView({ block: 'center', inline: 'center' });
         }
@@ -168,7 +177,7 @@ class DOMController {
         el.click();
       });
     } catch {
-      await this._page.click(selector, options);
+      await this._page.click(selector, clickOptions);
     }
   }
 
@@ -176,29 +185,31 @@ class DOMController {
    * Types text into an element matching selector.
    * @param {string} selector
    * @param {string} text
-   * @param {{ delay?: number }} [options]
+   * @param {{ timeout?: number, delay?: number }} [options]
+   *   timeout (ms) bounds the wait for a visible element; delay is the per-key pause.
    */
-  async type(selector, text, options) {
-    await this._page.waitForSelector(selector, { visible: true });
-    await this._ensureVisible(); // occluded windows swallow synthesized keys
-    await this._page.type(selector, text, options);
+  async type(selector, text, { timeout, delay } = {}) {
+    await this._page.waitForSelector(selector, { visible: true, timeout });
+    await this.ensureVisible(); // occluded windows swallow synthesized keys
+    await this._page.type(selector, text, { delay });
     // Verify the keys landed; if the revive failed they were dropped silently.
     const readBack = await this.getValue(selector).catch(() => null);
     if (readBack === null || !String(readBack).includes(text)) {
       // note: fallback is CDP Input.insertText — delivered even while occluded
-      // (measured). Focus + select-all first, so it replaces the content
+      // (reported behaviour; no automated test). Focus + select-all first, so it replaces the content
       // deterministically instead of appending at an unknown cursor. It fires
       // only an `input` event, no keydown/keyup — keystroke-dependent UIs
       // (autocomplete-on-keypress) may need a visible window; upgrade path:
       // per-key insertText loop.
       await this._page.evaluate((sel) => {
-        const el = document.querySelector(sel);
+        const el = /** @type {any} */ (document.querySelector(sel));
         if (!el) throw new Error(`Element not found: ${sel}`);
         el.focus();
         // setSelectionRange throws InvalidStateError on email/number inputs —
         // focus alone is enough there: insertText lands at the caret.
         try { el.setSelectionRange(0, el.value.length); } catch {}
       }, selector);
+      if (!this._cdp) throw new Error('insertText fallback needs a CDP session; this DOMController has none');
       await this._cdp.send('Input.insertText', { text });
     }
   }
@@ -218,10 +229,10 @@ class DOMController {
     await this._page.waitForSelector(selector, { visible: true });
     await this._page.evaluate(
       (sel, val) => {
-        const el = document.querySelector(sel);
+        const el = /** @type {any} */ (document.querySelector(sel));
         if (!el) throw new Error(`Element not found: ${sel}`);
         const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
-        if (desc && desc.set) desc.set.call(el, val);
+        if (desc?.set) desc.set.call(el, val);
         else el.value = val;
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -238,7 +249,7 @@ class DOMController {
    */
   async getValue(selector) {
     await this._page.waitForSelector(selector);
-    return this._page.$eval(selector, (el) => el.value);
+    return this._page.$eval(selector, (/** @type {any} */ el) => el.value);
   }
 
   /**
@@ -287,10 +298,12 @@ class DOMController {
    */
   async inspectElement(selector) {
     await this._page.waitForSelector(selector);
-    const elementData = await this._page.$eval(selector, (el) => {
+    /** @type {Record<string, any>} */
+    const elementData = await this._page.$eval(selector, (/** @type {any} */ el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
 
+      /** @type {Record<string, string>} */
       const attributes = {};
       for (const attr of el.attributes) {
         attributes[attr.name] = attr.value;
@@ -394,7 +407,7 @@ class DOMController {
   async dumpForms() {
     return this._page.evaluate(() => {
       return Array.from(document.forms).map((form, index) => {
-        const inputs = Array.from(form.elements).map((el) => ({
+        const inputs = Array.from(form.elements).map((/** @type {any} */ el) => ({
           name: el.name || '',
           id: el.id || '',
           tagName: el.tagName.toLowerCase(),
@@ -424,9 +437,10 @@ class DOMController {
    */
   async dumpHiddenInputs() {
     return this._page.evaluate(() => {
+      /** @type {Array<Record<string, string | null>>} */
       const items = [];
 
-      document.querySelectorAll('input[type="hidden"]').forEach((el) => {
+      document.querySelectorAll('input[type="hidden"]').forEach((/** @type {any} */ el) => {
         items.push({
           category: 'input[type="hidden"]',
           name: el.name || '',
@@ -458,18 +472,20 @@ class DOMController {
    */
   async dumpStorage() {
     return this._page.evaluate(() => {
+      /** @type {Record<string, string | null>} */
       const local = {};
       try {
         for (let i = 0; i < window.localStorage.length; i++) {
-          const k = window.localStorage.key(i);
+          const k = window.localStorage.key(i) ?? '';
           local[k] = window.localStorage.getItem(k);
         }
       } catch {}
 
+      /** @type {Record<string, string | null>} */
       const session = {};
       try {
         for (let i = 0; i < window.sessionStorage.length; i++) {
-          const k = window.sessionStorage.key(i);
+          const k = window.sessionStorage.key(i) ?? '';
           session[k] = window.sessionStorage.getItem(k);
         }
       } catch {}
@@ -487,9 +503,10 @@ class DOMController {
    */
   async hookPostMessage() {
     await this._page.evaluateOnNewDocument(() => {
-      if (window.__postMessageHookInstalled) return;
-      window.__postMessageHookInstalled = true;
-      window.__postMessageLogs = [];
+      const w = /** @type {any} */ (window); // the hook keeps its state on window, which TypeScript does not know
+      if (w.__postMessageHookInstalled) return;
+      w.__postMessageHookInstalled = true;
+      w.__postMessageLogs = [];
 
       const originalAddEventListener = window.addEventListener;
       const originalRemoveEventListener = window.removeEventListener;
@@ -497,45 +514,49 @@ class DOMController {
       // silently does nothing and the handler stays attached for the rest of the session.
       const wrappers = new WeakMap();
 
+      /** @this {Window} @param {string} type @param {any} listener @param {any} [options] */
       window.addEventListener = function (type, listener, options) {
         if (type === 'message' && listener) {
           let wrappedListener = wrappers.get(listener);
           if (!wrappedListener) {
+            /** @this {any} @param {MessageEvent} event */
             wrappedListener = function (event) {
-              window.__postMessageLogs.push({
+              w.__postMessageLogs.push({
                 direction: 'received',
                 origin: event.origin,
                 data: event.data,
                 timestamp: Date.now(),
               });
               return typeof listener === 'function'
-                ? listener.apply(this, arguments)
+                ? Reflect.apply(listener, this, arguments)
                 : listener.handleEvent(event);
             };
             wrappers.set(listener, wrappedListener);
           }
           return originalAddEventListener.call(this, type, wrappedListener, options);
         }
-        return originalAddEventListener.apply(this, arguments);
+        return Reflect.apply(originalAddEventListener, this, arguments);
       };
 
+      /** @this {Window} @param {string} type @param {any} listener @param {any} [options] */
       window.removeEventListener = function (type, listener, options) {
         const wrappedListener = type === 'message' && listener ? wrappers.get(listener) : null;
         if (wrappedListener) {
           return originalRemoveEventListener.call(this, type, wrappedListener, options);
         }
-        return originalRemoveEventListener.apply(this, arguments);
+        return Reflect.apply(originalRemoveEventListener, this, arguments);
       };
 
       const originalPostMessage = window.postMessage;
-      window.postMessage = function (message, targetOrigin, transfer) {
-        window.__postMessageLogs.push({
+      /** @this {Window} @param {any} message @param {string} [targetOrigin] */
+      w.postMessage = function (message, targetOrigin) {
+        w.__postMessageLogs.push({
           direction: 'sent',
           targetOrigin,
           data: message,
           timestamp: Date.now(),
         });
-        return originalPostMessage.apply(this, arguments);
+        return Reflect.apply(originalPostMessage, this, arguments);
       };
     });
   }
@@ -545,7 +566,7 @@ class DOMController {
    * @returns {Promise<Array<object>>}
    */
   async getPostMessageLogs() {
-    return this._page.evaluate(() => window.__postMessageLogs || []);
+    return this._page.evaluate(() => /** @type {any} */ (window).__postMessageLogs || []);
   }
 
   /**

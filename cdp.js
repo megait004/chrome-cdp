@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const os = require('node:os');
+const { assertEventually } = require('./src/waiting');
 
 const DEFAULT_PORT = 9222;
 const DEFAULT_PATHS = [
@@ -43,15 +44,14 @@ function checkCdpReady(port = DEFAULT_PORT) {
 }
 
 async function waitForCdp(port = DEFAULT_PORT, timeoutMs = 15000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const info = await checkCdpReady(port);
-    if (info) return info;
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  throw new Error(`Timed out waiting for Chrome CDP on port ${port}`);
+  return assertEventually(() => checkCdpReady(port), {
+    every: 500,
+    timeout: timeoutMs,
+    describe: `Chrome CDP endpoint on port ${port}`,
+  });
 }
 
+/** @param {{ port?: number }} [options] */
 async function startChrome(options = {}) {
   const port = options.port || Number(process.env.CDP_PORT) || DEFAULT_PORT;
   const existing = await checkCdpReady(port);
@@ -105,6 +105,6 @@ module.exports = {
   startChrome,
   findChromePath,
   checkCdpReady,
-  connect: (opts) => require('./index').connect(opts),
+  connect: (/** @type {Parameters<typeof import('./index').connect>[0]} */ opts) => require('./index').connect(opts),
   ChromeClient: require('./src/chrome-client'),
 };
