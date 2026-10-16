@@ -105,6 +105,5 @@ module.exports = {
   startChrome,
   findChromePath,
   checkCdpReady,
-  connect: (/** @type {Parameters<typeof import('./index').connect>[0]} */ opts) => require('./index').connect(opts),
   ChromeClient: require('./src/chrome-client'),
 };

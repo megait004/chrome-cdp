@@ -8,6 +8,8 @@
 	},
 	"scripts": {
 		"start": "node cdp.js",
+		"typecheck": "tsc -p jsconfig.json",
+		"typecheck:strict": "tsc -p jsconfig.json --strict --noImplicitAny",
 		"clean": "node cli.js clean"
 	},
 	"keywords": [
@@ -49,6 +51,7 @@
 		"@types/jsdom": "30.0.0",
 		"@types/node": "26.6.5",
 		"@types/turndown": "5.0.6",
-		"devtools-protocol": "0.0.1696802"
+		"devtools-protocol": "0.0.1696802",
+		"typescript": "7.0.2"
 	}
 }

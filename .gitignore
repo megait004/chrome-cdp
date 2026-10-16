@@ -8,3 +8,6 @@ node_modules/
 # itself stays lean. Re-clone with:
 #   git clone --depth 1 https://github.com/ChromeDevTools/devtools-protocol.git references/devtools-protocol
 references/devtools-protocol/
+# Sparse Chromium checkout for reading DevTools source (docs + devtools_protocol + inspector + devtools).
+# Re-create with: git clone --filter=blob:none --no-checkout --depth 1 https://github.com/chromium/chromium.git references/chromium
+references/chromium/

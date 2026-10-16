@@ -19,7 +19,6 @@ class WorkerController extends EventEmitter {
     browser.on('targetdestroyed', this._onTargetDestroyed);
   }
 
-  /** Attaches to the browser and tracks the workers that already exist. */
   /** @param {import('puppeteer-core').Browser} browser */
   static async create(browser) {
     const controller = new WorkerController(browser);

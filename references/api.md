@@ -272,12 +272,12 @@ For canvas games and iframes. Games draw on `<canvas>` inside an iframe, so the 
 | `traffic [url] [--bodies] [--wait S]` | With a URL: navigate, wait for network idle, then for the first WS frame; capture the load. Without: attach to the live tab and record `--wait S` (default 5) while the user interacts — no navigation, WebSocket state undisturbed. `--bodies` drains each response body into the result (redirect hops, 204/no-cors beacons and evicted bodies appear as a `(...)` note, never silently `null`) |
 
 **Late WebSocket attach.** A process that connects to a tab whose WebSocket was opened earlier misses the handshake — no socket URL is recoverable, so such sockets appear with `url: ''` (state corrected to `open`, since frames are flowing) and `traffic` adds a `note`. Frames on them still arrive and are searchable; to get the URL and handshake, load the page in the capturing process (`traffic <url>`).
-| `click-at <x> <y> [--frame U]` | Mouse click at coordinates; with `--frame`, relative to the iframe whose URL contains `U` |
-| `key <code> [--hold MS]` | Hold a key on the focused element (`KeyW`, `Space`, `ArrowLeft`) |
+| `click-at <x> <y> [--frame U] [--canvas] [--button left\|right\|middle]` | Mouse click. With `--frame`, coordinates are relative to that iframe's top-left. With `--canvas` too, x/y are canvas-relative and the canvas's offset inside the iframe is added (CSS px; scaled canvases unverified) |
+| `key <code> [--hold MS]` | Hold a key on the focused element (`KeyW`, `Space`, `ArrowLeft`). Takes no `--frame` (refused) |
 | `tabs` | Open tabs: `tab` index, `url`, `title`, `active` |
 | `frames` | Child iframes: `frame` index, canvas count, element count, url |
 | `canvas [--frame U] [--index N] [--out F.png] [--preserve]` | Canvas size; with `--out`, the pixels as PNG. `--preserve` reloads the tab first (the game restarts) so WebGL reads back |
 | `clean` | Deletes the scratch folder `.tmp/` inside the skill |
-| `eval [url] <expression> [--frame U]` | With a URL: navigate, then evaluate — self-contained. Without: runs against the currently open tab and leaves it open, so follow-up `eval`s inherit page state (logins, SPA routes). Objects print as JSON, not `[object Object]` |
+| `eval [url] <expression> [--frame U] [--file script.js]` | `--file` reads the expression from a file (use it instead of quoting in PowerShell). With `--frame`, waits up to the nav timeout for a frame whose URL contains `U`; a numeric index does not wait | With a URL: navigate, then evaluate — self-contained. Without: runs against the currently open tab and leaves it open, so follow-up `eval`s inherit page state (logins, SPA routes). Objects print as JSON, not `[object Object]` |
 
 Global flags: `--port <n>`, `--tab <n>` (attach to tab N instead of 0), `--json`, `--out <file>` (JSON-producing commands write to the file instead of stdout — parent dirs are created; stdout gets the path + size), `--help`.
