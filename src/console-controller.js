@@ -5,7 +5,7 @@ const matchesQuery = require('./match-query');
 
 /**
  * One console message or uncaught exception as this controller records it.
- * @typedef {{ type: string, text: string, args?: unknown[], stackTrace: Array<{ functionName: string, scriptId: string, url: string, lineNumber: number, columnNumber: number }>, executionContextId?: number, timestamp: number }} ConsoleEntry
+ * @typedef {{ type: string, text: string, args?: unknown[], stackTrace: Array<{ functionName: string, scriptId: string, url: string, lineNumber: number, columnNumber: number }>, executionContextId?: number, timestamp: number, scriptId?: string, url?: string, lineNumber?: number, columnNumber?: number }} ConsoleEntry
  */
 
 /**
@@ -25,7 +25,6 @@ class ConsoleController extends EventEmitter {
 
     this._page = page;
     this._cdp = cdpSession;
-    /** @type {Array<object>} */
     /** @type {ConsoleEntry[]} */
     this._logs = [];
     this._isRecording = false;
@@ -75,7 +74,7 @@ class ConsoleController extends EventEmitter {
    *   query?: string | RegExp,
    *   hasStackTrace?: boolean
    * }} [filter]
-   * @returns {Array<object>}
+   * @returns {ConsoleEntry[]}
    */
   getLogs(filter = {}) {
     return this._logs.filter((item) => {
@@ -132,7 +131,7 @@ class ConsoleController extends EventEmitter {
    * Eliminates cyclic reference and serialization errors.
    * @param {string} objectIdOrExpression
    * @param {{ ownProperties?: boolean }} [options]
-   * @returns {Promise<Array<{ name: string, value: any, type: string, isGetter: boolean, isSetter: boolean }>>}
+   * @returns {Promise<Array<{ name: string, value: any, type: string, isGetter: boolean, isSetter: boolean, writable?: boolean, enumerable?: boolean, configurable?: boolean }>>}
    */
   async inspectObject(objectIdOrExpression, { ownProperties = true } = {}) {
     let targetObjectId = objectIdOrExpression;

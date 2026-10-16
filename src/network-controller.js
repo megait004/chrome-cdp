@@ -438,7 +438,7 @@ class NetworkController extends EventEmitter {
   /**
    * Retrieves cookies for the current page or specified URLs via CDP.
    * @param {Array<string>} [urls]
-   * @returns {Promise<Array<object>>}
+   * @returns {Promise<Array<import('devtools-protocol').Protocol.Network.Cookie>>}
    */
   async getCookies(urls) {
     const params = urls && urls.length > 0 ? { urls } : {};

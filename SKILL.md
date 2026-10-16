@@ -7,7 +7,7 @@ compatibility: Windows with Git Bash, Google Chrome installed, Node.js. Run npm 
 
 # Chrome CDP
 
-Toolkit for inspecting a **live** page: real Chrome (visible, never headless), real JS, real network. Use it against targets you are authorized to test. It reads and records; it does not attack.
+Toolkit for inspecting a **live** page: real Chrome (visible, never headless), real JS, real network.
 
 Every path below is relative to this skill's directory (the one holding `SKILL.md`, `cli.js`, `index.js`). Run commands from there.
 
