@@ -6,6 +6,8 @@ const EventEmitter = require('node:events');
 const { webcrack } = require('webcrack');
 const { parse, Lang } = require('@ast-grep/napi');
 const matchesQuery = require('./match-query');
+const { safeDecode } = require('./util');
+
 
 /**
  * A loaded script, as Debugger.scriptParsed reports it, plus the fields this controller adds.
@@ -35,7 +37,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Enables the Debugger domain and starts collecting parsed scripts.
    * @returns {Promise<void>}
    */
   async enable() {
@@ -52,7 +53,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Disables the Debugger domain.
    * @returns {Promise<void>}
    */
   async disable() {
@@ -65,15 +65,11 @@ class SourceController extends EventEmitter {
     this._isEnabled = false;
   }
 
-  /**
-   * Clears in-memory script cache.
-   */
   clear() {
     this._scripts.clear();
   }
 
   /**
-   * Retrieves all loaded scripts with optional filtering.
    * @param {{
    *   url?: string | RegExp,
    *   excludeInternal?: boolean
@@ -96,8 +92,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Resolves a script ID from either a scriptId string, URL, or script object.
-   * Searches newest scripts first.
    * @param {string} scriptIdOrUrl
    * @returns {string}
    * @private
@@ -107,12 +101,15 @@ class SourceController extends EventEmitter {
       return scriptIdOrUrl;
     }
 
-    // Try finding by URL (reverse order to prioritize most recently loaded scripts)
-    const reversedEntries = Array.from(this._scripts.entries()).reverse();
-    for (const [id, script] of reversedEntries) {
-      if (script.url === scriptIdOrUrl || script.url.includes(scriptIdOrUrl)) {
-        return id;
-      }
+    // URLs are stored percent-encoded (a space is %20), so compare decoded forms too.
+    // Several hits is an error, not a silent first match: the first one may be an inline script.
+    const want = safeDecode(scriptIdOrUrl);
+    const hits = Array.from(this._scripts.entries()).filter(([, s]) => s.url === scriptIdOrUrl || safeDecode(s.url).includes(want));
+    if (hits.length === 1) return hits[0][0];
+    if (hits.length > 1) {
+      const exact = hits.filter(([, s]) => safeDecode(s.url) === want);
+      if (exact.length === 1) return exact[0][0];
+      throw new Error(`"${scriptIdOrUrl}" matches ${hits.length} scripts. Pass the scriptId instead: ${hits.map(([id, s]) => `${id} ${s.url || '(inline)'}`).join(' | ')}`);
     }
 
     if (/^\d+$/.test(scriptIdOrUrl)) {
@@ -123,8 +120,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Retrieves the raw source code of a script or bundle.
-   * Uses CDP Debugger.getScriptSource with transparent HTTP fallback if script was discarded.
    * @param {string} scriptIdOrUrl
    * @returns {Promise<{ scriptId: string, url: string, source: string }>}
    */
@@ -142,8 +137,6 @@ class SourceController extends EventEmitter {
         };
       }
     } catch (cdpErr) {
-      // If Debugger.getScriptSource fails (e.g. script discarded after navigation)
-      // fallback to fetching via network if URL is valid
       if (meta.url && (meta.url.startsWith('http://') || meta.url.startsWith('https://'))) {
         try {
           const res = await fetch(meta.url);
@@ -164,8 +157,7 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Searches for a string or regular expression inside loaded scripts/bundles.
-   * Equivalent to Chrome DevTools Source panel search (Ctrl+Shift+F).
+   * Searches the text of loaded scripts, like the DevTools Source panel search.
    * @param {string | RegExp} query
    * @param {{
    *   scriptId?: string,
@@ -204,7 +196,6 @@ class SourceController extends EventEmitter {
           })),
         };
       } catch {
-        // Discarded or internal scripts are safely ignored
         return null;
       }
     }));
@@ -212,7 +203,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Downloads a script or bundle directly to local disk.
    * @param {string} scriptIdOrUrl
    * @param {string} outputPath
    * @returns {Promise<{ filePath: string, bytesWritten: number, url: string }>}
@@ -235,7 +225,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Deobfuscates, unminifies, and transforms React JSX components using webcrack.
    * @param {string} scriptIdOrUrl
    * @param {import('webcrack').Options} [options]
    * @returns {Promise<{ scriptId: string, url: string, code: string, bundle?: import('webcrack').WebcrackResult['bundle'] }>}
@@ -253,7 +242,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Unpacks Webpack, Browserify, or other bundled modules into individual files on disk using webcrack.
    * @param {string} scriptIdOrUrl
    * @param {string} outputDirectory
    * @param {import('webcrack').Options} [options]
@@ -329,7 +317,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Internal handler for newly parsed scripts.
    * @private
    */
   /** @param {import('devtools-protocol').Protocol.Debugger.ScriptParsedEvent} script */
@@ -349,7 +336,6 @@ class SourceController extends EventEmitter {
   }
 
   /**
-   * Internal handler for execution contexts cleared (navigation).
    * @private
    */
   _onContextsCleared() {

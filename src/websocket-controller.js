@@ -6,10 +6,6 @@ const matchesQuery = require('./match-query');
 /** @typedef {import('./types/websocket').WsSocket} WsSocket */
 /** @typedef {import('./types/websocket').WsFrame} WsFrame */
 
-/**
- * Controller for intercepting, inspecting, and searching WebSocket connections and frames via CDP.
- * Tailored for security research, bug bounty, and reverse engineering.
- */
 class WebSocketController extends EventEmitter {
   /**
    * @param {import('puppeteer-core').CDPSession} cdpSession
@@ -33,7 +29,6 @@ class WebSocketController extends EventEmitter {
   }
 
   /**
-   * Enables WebSocket event tracking via CDP Network domain.
    * @returns {Promise<void>}
    */
   async startRecording() {
@@ -47,14 +42,10 @@ class WebSocketController extends EventEmitter {
     this._cdp.on('Network.webSocketFrameError', this._onFrameError);
     this._cdp.on('Network.webSocketClosed', this._onSocketClosed);
 
-    // WebSocket events are part of the Network domain; enable it for standalone use.
     await this._cdp.send('Network.enable');
     this._isRecording = true;
   }
 
-  /**
-   * Stops WebSocket event tracking.
-   */
   stopRecording() {
     if (!this._isRecording) return;
 
@@ -69,15 +60,11 @@ class WebSocketController extends EventEmitter {
     this._isRecording = false;
   }
 
-  /**
-   * Clears all recorded WebSocket connections and frames.
-   */
   clear() {
     this._sockets.clear();
   }
 
   /**
-   * Retrieves recorded WebSocket connections with optional filtering.
    * @param {{
    *   url?: string | RegExp,
    *   state?: 'connecting' | 'open' | 'closed' | 'error'
@@ -92,7 +79,6 @@ class WebSocketController extends EventEmitter {
   }
 
   /**
-   * Retrieves frames for a specific socket or across all sockets.
    * @param {string} [socketIdOrUrl]
    * @param {{
    *   direction?: 'sent' | 'received',
@@ -140,8 +126,6 @@ class WebSocketController extends EventEmitter {
   }
 
   /**
-   * Searches across all recorded WebSocket frames for matching strings or patterns.
-   * Crucial for finding auth tokens, signatures, or specific API payloads in live WS traffic.
    * @param {string | RegExp} query
    * @param {{ direction?: 'sent' | 'received' }} [options]
    * @returns {Array<{ socketId: string, url: string, frame: WsFrame }>}

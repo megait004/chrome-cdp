@@ -15,16 +15,13 @@ const DebugController = require('./debug-controller');
 const PerformanceController = require('./performance-controller');
 const VisualController = require('./visual-controller');
 
-// Register stealth plugin once globally on puppeteer-extra
 puppeteer.use(StealthPlugin());
 
 /**
- * Every controller a tab exposes, as ChromeClient wires them.
  * @typedef {{ dom: InstanceType<typeof DOMController>, network: InstanceType<typeof NetworkController>, websocket: InstanceType<typeof WebSocketController>, console: InstanceType<typeof ConsoleController>, sources: InstanceType<typeof SourceController>, debug: InstanceType<typeof DebugController>, performance: InstanceType<typeof PerformanceController>, visual: InstanceType<typeof VisualController> }} Controllers
  */
 
 /**
- * Builds the per-tab controllers. Kept separate so tests can inject fakes.
  * @param {import('puppeteer-core').Page} page
  * @param {import('puppeteer-core').CDPSession} cdpSession
  * @returns {Controllers}
@@ -43,10 +40,6 @@ function createControllers(page, cdpSession) {
   };
 }
 
-/**
- * Unified high-level Chrome CDP Client.
- * Orchestrates DOM manipulation, network inspection, console interaction, and source analysis.
- */
 class ChromeClient {
   /**
    * @param {import('puppeteer-core').Browser} browser
@@ -129,7 +122,6 @@ class ChromeClient {
   }
 
   /**
-   * Creates a new tab and attaches a new CDP session and controllers.
    * @param {{ autoEnableAll?: boolean }} [options]
    * @returns {Promise<ChromeClient>}
    */
@@ -151,8 +143,7 @@ class ChromeClient {
   }
 
   /**
-   * Navigates to a URL with resilient handling for SPAs, games, and streaming sites.
-   * Defaults to 'domcontentloaded' with fallback to prevent indefinite network spinning.
+   * Navigates and waits for 'domcontentloaded' by default. Waiting for network idle can spin forever on streaming sites and games.
    * @param {string} url
    * @param {import('puppeteer-core').WaitForOptions} [options]
    * @returns {Promise<import('puppeteer-core').HTTPResponse | null>}
@@ -204,7 +195,6 @@ class ChromeClient {
   }
 
   /**
-   * Gets current page title.
    * @returns {Promise<string>}
    */
   async title() {
@@ -212,7 +202,6 @@ class ChromeClient {
   }
 
   /**
-   * Gets current page HTML.
    * @returns {Promise<string>}
    */
   async content() {
@@ -225,35 +214,28 @@ class ChromeClient {
   // captureScreenshot; only Browser.setWindowBounds('normal') revives it.
 
   /**
-   * Evaluates JavaScript in the page context.
-   * Shortcut to console.evaluate.
-   * @param {string | ((...args: any[]) => any)} expressionOrFn
-   * @param {...any} args
-   * @returns {Promise<any>}
+   * @template {unknown[]} P
+   * @template R
+   * @param {string | ((...args: import('puppeteer-core').InnerParams<P>) => R)} expressionOrFn
+   * @param {P} args
+   * @returns {Promise<Awaited<R>>}
    */
   async evaluate(expressionOrFn, ...args) {
     return this.console.evaluate(expressionOrFn, ...args);
   }
 
   /**
-   * Converts current page main article to Markdown.
-   * Shortcut to dom.toMarkdown.
    * @param {object} [options]
    */
   async toMarkdown(options) {
     return this.dom.toMarkdown(options);
   }
 
-  /**
-   * Loads current page into Cheerio.
-   * Shortcut to dom.toCheerio.
-   */
   async toCheerio() {
     return this.dom.toCheerio();
   }
 
   /**
-   * Closes active tab.
    * @returns {Promise<void>}
    */
   async closePage() {
@@ -271,7 +253,7 @@ class ChromeClient {
   }
 
   /**
-   * Disconnects CDP client from browser (keeps Chrome running).
+   * Disconnects from the browser. Chrome keeps running.
    */
   async disconnect() {
     await this._release();
@@ -293,7 +275,6 @@ class ChromeClient {
   }
 
   /**
-   * Closes browser completely.
    * @returns {Promise<void>}
    */
   async closeBrowser() {
