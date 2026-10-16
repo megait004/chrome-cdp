@@ -2,6 +2,7 @@
 name: chrome-cdp
 description: Drive a real Chrome over the DevTools Protocol to audit a live page - dump forms and hidden inputs, capture raw HTTP and WebSocket frames for Burp, trace event listeners and postMessage handlers back to source, search and deobfuscate loaded JS bundles, query the V8 heap, and extract page content as Markdown. Use this whenever the question is about what a real site actually does at runtime rather than what its static HTML says - reverse engineering a signing or token algorithm, finding an undocumented API, replaying a request, auditing a login flow, inspecting a WebSocket protocol, unminifying a bundle, or debugging why a page behaves the way it does. It also drives canvas games and iframes (list frames, click and hold keys by coordinates, read canvases). Reach for it even when the user only says "look at this site", "how does this site do X", or "find the API behind this page" without naming Chrome, CDP, or DevTools.
 license: ISC
+compatibility: Windows with Git Bash, Google Chrome installed, Node.js. Run npm install in this skill directory if node_modules is missing.
 ---
 
 # Chrome CDP
@@ -41,7 +42,7 @@ Every path below is relative to this skill's directory (the one holding `SKILL.m
 
 - **Snapshot, don't screenshot.** The CLI has no screenshot command. Text drawn on a canvas is invisible to `snapshot`: read the app's state with `eval --frame`, or the pixels with `canvas --out` only when the state cannot answer the question.
 - **Recording starts at connect.** `traffic <url>` captures the load; anything before the attach is invisible. A live tab is read with `traffic --wait S` (no URL).
-- **Git Bash rewrites a leading `/`** into `C:/Program Files/Git/`. Frame and tab arguments strip that prefix, but `--frame game.html` or `--frame 1` is safer than `--frame /game`.
+- **Git Bash rewrites a leading `/`** into `C:/Program Files/Git/`. Frame and tab arguments strip that prefix, but `--frame game.html` or a frame index from `frames` (`--frame 1`) is safer than `--frame /game`.
 - **Keys go to the focused element.** Click the game first, or `key` does nothing visible.
 - **A minimized or covered Chrome window** drops synthesized keys and hangs screenshots. `type` revives the window itself; see `references/guide.md`.
 
