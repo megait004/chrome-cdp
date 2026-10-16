@@ -4,14 +4,67 @@ const EventEmitter = require('node:events');
 const matchesQuery = require('./match-query');
 
 /**
+ * One recorded request. Every leaf type is read from the CDP protocol, so a protocol change
+ * shows up here as a type error instead of drifting. Fields a later event fills in are null
+ * until it arrives; bodies come from getResponseBody, not from an event.
+ * @typedef {object} TrafficEntry
+ * @property {string} id
+ * @property {string} cdpRequestId
+ * @property {number} redirectIndex
+ * @property {string | null} redirectedFrom
+ * @property {string | null} redirectedTo
+ * @property {import('devtools-protocol').Protocol.Network.Request['url']} url
+ * @property {import('devtools-protocol').Protocol.Network.Request['method']} method
+ * @property {import('devtools-protocol').Protocol.Network.ResourceType} resourceType
+ * @property {import('devtools-protocol').Protocol.Network.Request['headers']} headers
+ * @property {import('devtools-protocol').Protocol.Network.RequestWillBeSentExtraInfoEvent['headers'] | null} rawHeaders
+ * @property {string | null} postData rebuilt from postDataEntries (postData itself is deprecated)
+ * @property {number | null} startTime
+ * @property {import('devtools-protocol').Protocol.Network.RequestWillBeSentEvent['wallTime']} [wallTime]
+ * @property {import('devtools-protocol').Protocol.Network.Initiator} [initiator]
+ * @property {import('devtools-protocol').Protocol.Network.Response['status'] | null} status
+ * @property {import('devtools-protocol').Protocol.Network.Response['statusText'] | null} statusText
+ * @property {import('devtools-protocol').Protocol.Network.Response['headers'] | null} responseHeaders
+ * @property {import('devtools-protocol').Protocol.Network.ResponseReceivedExtraInfoEvent['headers'] | null} rawResponseHeaders
+ * @property {import('devtools-protocol').Protocol.Network.ResponseReceivedExtraInfoEvent['headersText'] | null} rawResponseHeadersText
+ * @property {import('devtools-protocol').Protocol.Network.ResponseReceivedExtraInfoEvent['statusCode']} [rawStatusCode]
+ * @property {import('devtools-protocol').Protocol.Network.Response['mimeType'] | null} mimeType
+ * @property {import('devtools-protocol').Protocol.Network.Response['remoteIPAddress'] | null} remoteIPAddress
+ * @property {import('devtools-protocol').Protocol.Network.Response['remotePort'] | null} remotePort
+ * @property {import('devtools-protocol').Protocol.Network.Response['protocol'] | null} protocol
+ * @property {import('devtools-protocol').Protocol.Network.LoadingFinishedEvent['encodedDataLength'] | null} encodedDataLength
+ * @property {number | null} durationMs
+ * @property {boolean} failed
+ * @property {import('devtools-protocol').Protocol.Network.LoadingFailedEvent['errorText'] | null} errorText
+ * @property {import('devtools-protocol').Protocol.Network.LoadingFailedEvent['canceled']} [canceled]
+ * @property {import('devtools-protocol').Protocol.Network.Response['securityState']} [securityState]
+ * @property {import('devtools-protocol').Protocol.Network.RequestWillBeSentExtraInfoEvent['clientSecurityState'] | null} [clientSecurityState]
+ * @property {import('devtools-protocol').Protocol.Network.RequestWillBeSentExtraInfoEvent['associatedCookies']} [associatedCookies]
+ * @property {string} [responseBody]
+ * @property {boolean} [responseBase64]
+ */
+
+/**
  * Advanced Network Controller built on raw Chrome DevTools Protocol (CDP) events.
  * Captures raw headers, unnormalized pseudo-headers, raw request POST data,
  * response bodies, cookies, and formats traffic for security research and reverse engineering.
  */
+/**
+ * Rebuilds a POST body from the protocol's postDataEntries. Each entry carries one base64
+ * chunk; the deprecated postData string is no longer used. Null when there is no body.
+ * note: entries can be absent for very large bodies; getRequestPostData fetches those.
+ * @param {Array<{ bytes?: string }> | undefined} entries
+ * @returns {string | null}
+ */
+function decodePostData(entries) {
+  if (!entries || entries.length === 0) return null;
+  return entries.map((entry) => (entry.bytes ? Buffer.from(entry.bytes, 'base64').toString('utf8') : '')).join('');
+}
+
 class NetworkController extends EventEmitter {
   /**
-   * @param {import('puppeteer').Page} page
-   * @param {import('puppeteer').CDPSession} cdpSession
+   * @param {import('puppeteer-core').Page} page
+   * @param {import('puppeteer-core').CDPSession} cdpSession
    */
   constructor(page, cdpSession) {
     super();
@@ -20,7 +73,7 @@ class NetworkController extends EventEmitter {
 
     this._page = page;
     this._cdp = cdpSession;
-    /** @type {Map<string, object>} */
+    /** @type {Map<string, TrafficEntry>} */
     this._entries = new Map();
     this._isRecording = false;
 
@@ -51,8 +104,8 @@ class NetworkController extends EventEmitter {
     // cross-process navigations (protocol v0.0.1716261, experimental — older
     // Chrome builds reject the command, hence the silent catch). Without it,
     // bodies die on navigation; this is what makes getResponseBody reliable.
-    // Trade-off measured on Chrome 154: Network.searchInResponseBody cannot
-    // see durable-stored bodies, so searchBodies() falls back to a local match.
+    // Trade-off: Network.searchInResponseBody may not see durable-stored bodies,
+    // so searchBodies() falls back to a local match (not covered by an automated test).
     await this._cdp.send('Network.configureDurableMessages', {
       maxTotalBufferSize: 100_000_000,
       maxResourceBufferSize: 5_000_000,
@@ -92,7 +145,7 @@ class NetworkController extends EventEmitter {
    *   status?: number,
    *   failedOnly?: boolean
    * }} [filter]
-   * @returns {Array<object>}
+   * @returns {Array<TrafficEntry>}
    */
   getTraffic(filter = {}) {
     const list = Array.from(this._entries.values());
@@ -157,7 +210,7 @@ class NetworkController extends EventEmitter {
         return res.postData;
       }
     } catch {
-      if (entry && entry.postData) {
+      if (entry?.postData) {
         return entry.postData;
       }
     }
@@ -207,7 +260,8 @@ class NetworkController extends EventEmitter {
         parsedJson,
       };
     } catch (err) {
-      throw new Error(`Failed to retrieve response body for request ${requestId}: ${err.message}`);
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to retrieve response body for request ${requestId}: ${message}`);
     }
   }
 
@@ -281,10 +335,10 @@ class NetworkController extends EventEmitter {
    * Searches across all captured HTTP requests and responses for strings or regex.
    * Searches in URL, Request Headers, Request Body, and Response Headers.
    * @param {string | RegExp} query
-   * @returns {Array<object>}
+   * @returns {Array<{ requestId: string, url: string, method: string, status: number | null, matchedFields: string[], entry: TrafficEntry }>}
    */
   searchTraffic(query) {
-    const test = (str) => matchesQuery(str, query);
+    const test = (/** @type {string | null | undefined} */ str) => matchesQuery(str, query); // non-strings never match
 
     const matches = [];
     for (const entry of this._entries.values()) {
@@ -319,10 +373,10 @@ class NetworkController extends EventEmitter {
    * local match, so results stay consistent in both storage modes.
    * @param {string | RegExp} query substring, or RegExp with /flags suffix
    * @param {{ requestId?: string }} [options] limit to one request
-   * @returns {Promise<Array<{ requestId, url, matchLineNumbers }>>}
+   * @returns {Promise<Array<{ requestId: string, url: string, matchLineNumbers: number[] }>>}
    */
   async searchBodies(query, options = {}) {
-    const re = typeof query === 'string' ? query.match(/^\/(.+)\/([gimsuy]*)$/s) : null;
+    const re = typeof query === 'string' ? /^\/(.+)\/([gimsuy]*)$/s.exec(query) : null;
     // A RegExp instance must contribute its source, not String(query)'s '/.../' form.
     const searchQuery = query instanceof RegExp ? query.source : (re ? re[1] : String(query));
     const isRegex = typeof query !== 'string' || Boolean(re);
@@ -332,13 +386,12 @@ class NetworkController extends EventEmitter {
       : false;                        // plain string: substring search is case-insensitive
     const localRegex = new RegExp(searchQuery, caseSensitive ? '' : 'i');
 
-    const targets = options.requestId
-      ? [this._entries.get(options.requestId)].filter(Boolean)
-      : Array.from(this._entries.values());
+    const single = options.requestId ? this._entries.get(options.requestId) : undefined;
+    const targets = options.requestId ? (single ? [single] : []) : Array.from(this._entries.values());
 
-    const results = [];
-    for (const entry of targets) {
+    const found = await Promise.all(targets.map(async (entry) => {
       const id = entry.cdpRequestId || entry.id;
+      /** @type {number[] | null} */
       let lineNumbers = null;
       try {
         const res = await this._cdp.send('Network.searchInResponseBody', {
@@ -354,20 +407,20 @@ class NetworkController extends EventEmitter {
         // Fall back to a local match over getResponseBody; text bodies only.
         try {
           const body = await this.getResponseBody(id);
-          if (body && body.base64Encoded) lineNumbers = [];
+          if (body?.base64Encoded) lineNumbers = [];
           else {
             lineNumbers = String(body.body || '')
               .split('\n')
               .map((line, i) => (localRegex.test(line) ? i : -1))
               .filter((i) => i >= 0);
           }
-        } catch { continue; } // body gone entirely — nothing to search
+        } catch { return null; } // body gone entirely — nothing to search
       }
-      if (lineNumbers.length > 0) {
-        results.push({ requestId: entry.id, url: entry.url, matchLineNumbers: lineNumbers });
-      }
-    }
-    return results;
+      return lineNumbers.length > 0
+        ? { requestId: entry.id, url: entry.url, matchLineNumbers: lineNumbers }
+        : null;
+    }));
+    return found.filter((hit) => hit !== null);
   }
 
   /**
@@ -412,9 +465,11 @@ class NetworkController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {string} id */
   _getOrCreateEntry(id) {
-    if (!this._entries.has(id)) {
-      this._entries.set(id, {
+    let entry = this._entries.get(id);
+    if (!entry) {
+      entry = {
         id,
         cdpRequestId: id,
         redirectIndex: 0,
@@ -442,9 +497,10 @@ class NetworkController extends EventEmitter {
         durationMs: null,
         failed: false,
         errorText: null,
-      });
+      };
+      this._entries.set(id, entry);
     }
-    return this._entries.get(id);
+    return entry;
   }
 
   /**
@@ -457,11 +513,12 @@ class NetworkController extends EventEmitter {
    * @returns {number}
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.RequestWillBeSentEvent} event */
   _preserveRedirectedHop(event) {
-    const finishedHop = event.redirectResponse && this._entries.get(event.requestId);
-    if (!finishedHop) return 0;
-
     const cause = event.redirectResponse;
+    const finishedHop = cause && this._entries.get(event.requestId);
+    if (!cause || !finishedHop) return 0;
+
     finishedHop.status = cause.status;
     finishedHop.statusText = cause.statusText;
     finishedHop.responseHeaders = cause.headers;
@@ -482,6 +539,7 @@ class NetworkController extends EventEmitter {
     return finishedHop.redirectIndex + 1;
   }
 
+  /** @param {import('devtools-protocol').Protocol.Network.RequestWillBeSentEvent} event */
   _onRequestWillBeSent(event) {
     const redirectIndex = this._preserveRedirectedHop(event);
 
@@ -491,7 +549,7 @@ class NetworkController extends EventEmitter {
     entry.url = event.request.url;
     entry.method = event.request.method;
     entry.headers = event.request.headers;
-    entry.postData = event.request.postData || null;
+    entry.postData = decodePostData(event.request.postDataEntries);
     entry.resourceType = event.type || 'Other';
     entry.startTime = event.timestamp * 1000;
     entry.wallTime = event.wallTime;
@@ -503,6 +561,7 @@ class NetworkController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.RequestWillBeSentExtraInfoEvent} event */
   _onRequestExtraInfo(event) {
     const entry = this._getOrCreateEntry(event.requestId);
     entry.rawHeaders = event.headers;
@@ -513,6 +572,7 @@ class NetworkController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.ResponseReceivedEvent} event */
   _onResponseReceived(event) {
     const entry = this._getOrCreateEntry(event.requestId);
     const resp = event.response;
@@ -535,6 +595,7 @@ class NetworkController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.ResponseReceivedExtraInfoEvent} event */
   _onResponseExtraInfo(event) {
     const entry = this._getOrCreateEntry(event.requestId);
     entry.rawResponseHeaders = event.headers;
@@ -545,6 +606,7 @@ class NetworkController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.LoadingFinishedEvent} event */
   _onLoadingFinished(event) {
     const entry = this._getOrCreateEntry(event.requestId);
     entry.encodedDataLength = event.encodedDataLength;
@@ -557,6 +619,7 @@ class NetworkController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.LoadingFailedEvent} event */
   _onLoadingFailed(event) {
     const entry = this._getOrCreateEntry(event.requestId);
     entry.failed = true;

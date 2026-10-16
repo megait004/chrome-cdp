@@ -1,6 +1,8 @@
 'use strict';
 
-const DEFAULTS = { timeout: 20000, every: 300, min: 1 };
+const { WAIT_TIMEOUT_MS } = require("./timeouts");
+
+const DEFAULTS = { timeout: WAIT_TIMEOUT_MS, every: 300, min: 1 };
 
 /**
  * Polls until `fn` returns a ready value. Synchronization, not a claim: on timeout
@@ -15,9 +17,10 @@ async function waitUntil(fn, options = {}) {
   const deadline = Date.now() + timeout;
   let observed = await fn();
 
+  // Sampling is sequential by design: each sample follows the previous one after a pause.
   while (!isReady(observed, min) && hasTimeForAnotherPoll(deadline, every)) {
-    await sleep(every);
-    observed = await fn();
+    await sleep(every); // NOSONAR S9382
+    observed = await fn(); // NOSONAR S9382
   }
 
   return observed;
@@ -47,12 +50,15 @@ async function assertEventually(fn, options = {}) {
  * @param {{ timeout?: number, count?: number, where?: (payload: any) => boolean }} [options]
  * @returns {Promise<any[]>} Collected payloads, in arrival order.
  */
-function waitForEvent(emitter, eventName, { timeout = 20000, count = 1, where } = {}) {
+function waitForEvent(emitter, eventName, { timeout = WAIT_TIMEOUT_MS, count = 1, where } = {}) {
   return new Promise((resolve, reject) => {
+    /** @type {any[]} */
     const collected = [];
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
     let timer;
 
-    const settle = (finish) => (value) => {
+    /** @param {(v: any) => void} finish */
+    const settle = (finish) => (/** @type {any} */ value) => {
       clearTimeout(timer);
       emitter.off(eventName, collect);
       finish(value);
@@ -60,6 +66,7 @@ function waitForEvent(emitter, eventName, { timeout = 20000, count = 1, where } 
     const stopListening = settle(resolve);
     const fail = settle(reject);
 
+    /** @param {any} payload */
     function collect(payload) {
       try {
         if (where && !where(payload)) return;
@@ -76,20 +83,33 @@ function waitForEvent(emitter, eventName, { timeout = 20000, count = 1, where } 
   });
 }
 
+/**
+ * A value is ready when it is truthy, and, if it has a length, when that length reaches `min`.
+ * @param {unknown} value
+ * @param {number} min
+ * @returns {boolean}
+ */
 function isReady(value, min) {
   if (!value) return false;
-  if (typeof value.length === 'number') return value.length >= min;
+  const length = /** @type {{ length?: unknown }} */ (value).length;
+  if (typeof length === 'number') return length >= min;
   return true;
 }
 
+/** @param {number} deadline @param {number} every */
 function hasTimeForAnotherPoll(deadline, every) {
   return Date.now() + every < deadline;
 }
 
+/** @param {number} ms */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * @param {unknown} observed
+ * @param {{ timeout: number, min: number, describe?: string }} options
+ */
 function describeFailedWait(observed, { timeout, min, describe }) {
   const shortfall = min > 1 ? `, needed at least ${min}` : '';
   return (
@@ -99,9 +119,11 @@ function describeFailedWait(observed, { timeout, min, describe }) {
   );
 }
 
+/** @param {unknown} value */
 function summarize(value) {
   if (value === null || value === undefined) return String(value);
-  if (typeof value.length === 'number') return `length ${value.length}`;
+  const length = /** @type {{ length?: unknown }} */ (value).length;
+  if (typeof length === 'number') return `length ${length}`;
   return typeof value;
 }
 

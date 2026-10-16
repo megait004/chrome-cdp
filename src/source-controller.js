@@ -4,8 +4,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const EventEmitter = require('node:events');
 const { webcrack } = require('webcrack');
-const { js } = require('@ast-grep/napi');
+const { parse, Lang } = require('@ast-grep/napi');
 const matchesQuery = require('./match-query');
+
+/**
+ * A loaded script, as Debugger.scriptParsed reports it, plus the fields this controller adds.
+ * @typedef {Pick<import('devtools-protocol').Protocol.Debugger.ScriptParsedEvent, 'scriptId' | 'startLine' | 'startColumn' | 'endLine' | 'endColumn' | 'hash' | 'sourceMapURL'> & { url: string }} ScriptInfo
+ */
 
 /**
  * Controller for inspecting JavaScript sources, searching within bundles,
@@ -14,7 +19,7 @@ const matchesQuery = require('./match-query');
  */
 class SourceController extends EventEmitter {
   /**
-   * @param {import('puppeteer').CDPSession} cdpSession
+   * @param {import('puppeteer-core').CDPSession} cdpSession
    */
   constructor(cdpSession) {
     super();
@@ -22,6 +27,7 @@ class SourceController extends EventEmitter {
 
     this._cdp = cdpSession;
     /** @type {Map<string, object>} */
+    /** @type {Map<string, ScriptInfo>} */
     this._scripts = new Map();
     this._isEnabled = false;
 
@@ -73,15 +79,13 @@ class SourceController extends EventEmitter {
    *   url?: string | RegExp,
    *   excludeInternal?: boolean
    * }} [filter]
-   * @returns {Array<object>}
+   * @returns {ScriptInfo[]}
    */
   getScripts(filter = {}) {
     const scripts = Array.from(this._scripts.values());
     return scripts.filter((s) => {
-      if (
-        filter.excludeInternal &&
-        (!s.url || s.url.startsWith('pptr:') || s.url.startsWith('chrome-extension:'))
-      ) {
+      // Inline <script> blocks have an empty url and are app code: keep them. Only browser internals go.
+      if (filter.excludeInternal && /^(pptr:|chrome-extension:)/.test(s.url)) {
         return false;
       }
       if (filter.url) {
@@ -131,7 +135,7 @@ class SourceController extends EventEmitter {
 
     try {
       const result = await this._cdp.send('Debugger.getScriptSource', { scriptId });
-      if (result && result.scriptSource) {
+      if (result?.scriptSource) {
         return {
           scriptId,
           url: meta.url,
@@ -181,9 +185,7 @@ class SourceController extends EventEmitter {
       ? [{ scriptId: this._resolveScriptId(options.scriptId) }]
       : this.getScripts({ excludeInternal: options.excludeInternal !== false });
 
-    const results = [];
-
-    for (const target of targets) {
+    const found = await Promise.all(targets.map(async (target) => {
       try {
         const response = await this._cdp.send('Debugger.searchInContent', {
           scriptId: target.scriptId,
@@ -192,23 +194,22 @@ class SourceController extends EventEmitter {
           isRegex: isRegex || Boolean(options.isRegex),
         });
 
-        if (response.result && response.result.length > 0) {
-          const meta = this._scripts.get(target.scriptId);
-          results.push({
-            scriptId: target.scriptId,
-            url: meta?.url || '',
-            matches: response.result.map((m) => ({
-              lineNumber: m.lineNumber,
-              lineContent: m.lineContent,
-            })),
-          });
-        }
+        if (!response.result || response.result.length === 0) return null;
+        const meta = this._scripts.get(target.scriptId);
+        return {
+          scriptId: target.scriptId,
+          url: meta?.url || '',
+          matches: response.result.map((m) => ({
+            lineNumber: m.lineNumber,
+            lineContent: m.lineContent,
+          })),
+        };
       } catch {
         // Discarded or internal scripts are safely ignored
+        return null;
       }
-    }
-
-    return results;
+    }));
+    return found.filter((hit) => hit !== null);
   }
 
   /**
@@ -238,7 +239,7 @@ class SourceController extends EventEmitter {
    * Deobfuscates, unminifies, and transforms React JSX components using webcrack.
    * @param {string} scriptIdOrUrl
    * @param {import('webcrack').Options} [options]
-   * @returns {Promise<{ scriptId: string, url: string, code: string, bundle?: import('webcrack').Bundle }>}
+   * @returns {Promise<{ scriptId: string, url: string, code: string, bundle?: import('webcrack').WebcrackResult['bundle'] }>}
    */
   async deobfuscateBundle(scriptIdOrUrl, options = {}) {
     const { source, url, scriptId } = await this.getScriptSource(scriptIdOrUrl);
@@ -305,12 +306,12 @@ class SourceController extends EventEmitter {
       code = src.source;
     }
 
-    const tree = js.parse(code);
+    const tree = parse(Lang.JavaScript, code);
     const root = tree.root();
     const matchedNodes = root.findAll(pattern);
 
     return matchedNodes.map((node) => {
-      const metaMatches = {};
+      const metaMatches = /** @type {Record<string, string>} */ ({});
       const variableNames = pattern.match(/\$[A-Z0-9_]+/g) || [];
       for (const v of variableNames) {
         const cleanName = v.replace(/^\$/, '');
@@ -332,6 +333,7 @@ class SourceController extends EventEmitter {
    * Internal handler for newly parsed scripts.
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Debugger.ScriptParsedEvent} script */
   _onScriptParsed(script) {
     const entry = {
       scriptId: script.scriptId,
@@ -341,7 +343,6 @@ class SourceController extends EventEmitter {
       endLine: script.endLine,
       endColumn: script.endColumn,
       hash: script.hash,
-      isContentScript: script.isContentScript || false,
       sourceMapURL: script.sourceMapURL || '',
     };
     this._scripts.set(script.scriptId, entry);

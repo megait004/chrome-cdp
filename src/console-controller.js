@@ -4,14 +4,19 @@ const EventEmitter = require('node:events');
 const matchesQuery = require('./match-query');
 
 /**
+ * One console message or uncaught exception as this controller records it.
+ * @typedef {{ type: string, text: string, args?: unknown[], stackTrace: Array<{ functionName: string, scriptId: string, url: string, lineNumber: number, columnNumber: number }>, executionContextId?: number, timestamp: number }} ConsoleEntry
+ */
+
+/**
  * Advanced Console and Runtime Controller for CDP.
  * Captures full V8 call stack traces, unhandled exceptions, RemoteObject inspection,
  * and heap object querying for reverse engineering.
  */
 class ConsoleController extends EventEmitter {
   /**
-   * @param {import('puppeteer').Page} page
-   * @param {import('puppeteer').CDPSession} cdpSession
+   * @param {import('puppeteer-core').Page} page
+   * @param {import('puppeteer-core').CDPSession} cdpSession
    */
   constructor(page, cdpSession) {
     super();
@@ -21,6 +26,7 @@ class ConsoleController extends EventEmitter {
     this._page = page;
     this._cdp = cdpSession;
     /** @type {Array<object>} */
+    /** @type {ConsoleEntry[]} */
     this._logs = [];
     this._isRecording = false;
 
@@ -58,6 +64,7 @@ class ConsoleController extends EventEmitter {
    * Clears recorded console logs.
    */
   clear() {
+    /** @type {ConsoleEntry[]} */
     this._logs = [];
   }
 
@@ -89,7 +96,7 @@ class ConsoleController extends EventEmitter {
   /**
    * Evaluates an expression or function in the page context via CDP Runtime.evaluate.
    * Returns unwrapped result value.
-   * @param {string | Function} expressionOrFn
+   * @param {string | ((...args: any[]) => any)} expressionOrFn
    * @param {...any} args
    * @returns {Promise<any>}
    */
@@ -234,13 +241,14 @@ class ConsoleController extends EventEmitter {
    * Internal handler for Runtime.consoleAPICalled.
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Runtime.ConsoleAPICalledEvent} event */
   _onConsoleAPICalled(event) {
     const text = event.args
-      .map((a) => (a.value !== undefined ? String(a.value) : a.description || ''))
+      .map((/** @type {import('devtools-protocol').Protocol.Runtime.RemoteObject} */ a) => (a.value !== undefined ? String(a.value) : a.description || ''))
       .join(' ');
 
     const stackTrace =
-      event.stackTrace?.callFrames?.map((f) => ({
+      event.stackTrace?.callFrames?.map((/** @type {import('devtools-protocol').Protocol.Runtime.CallFrame} */ f) => ({
         functionName: f.functionName || '(anonymous)',
         scriptId: f.scriptId,
         url: f.url,
@@ -265,13 +273,14 @@ class ConsoleController extends EventEmitter {
    * Internal handler for Runtime.exceptionThrown.
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Runtime.ExceptionThrownEvent} event */
   _onExceptionThrown(event) {
     const details = event.exceptionDetails;
     const text =
       details.exception?.description || details.text || 'Unhandled runtime exception';
 
     const stackTrace =
-      details.stackTrace?.callFrames?.map((f) => ({
+      details.stackTrace?.callFrames?.map((/** @type {import('devtools-protocol').Protocol.Runtime.CallFrame} */ f) => ({
         functionName: f.functionName || '(anonymous)',
         scriptId: f.scriptId,
         url: f.url,

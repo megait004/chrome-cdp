@@ -3,13 +3,16 @@
 const EventEmitter = require('node:events');
 const matchesQuery = require('./match-query');
 
+/** @typedef {import('./types/websocket').WsSocket} WsSocket */
+/** @typedef {import('./types/websocket').WsFrame} WsFrame */
+
 /**
  * Controller for intercepting, inspecting, and searching WebSocket connections and frames via CDP.
  * Tailored for security research, bug bounty, and reverse engineering.
  */
 class WebSocketController extends EventEmitter {
   /**
-   * @param {import('puppeteer').CDPSession} cdpSession
+   * @param {import('puppeteer-core').CDPSession} cdpSession
    */
   constructor(cdpSession) {
     super();
@@ -17,6 +20,7 @@ class WebSocketController extends EventEmitter {
 
     this._cdp = cdpSession;
     /** @type {Map<string, object>} */
+    /** @type {Map<string, WsSocket>} */
     this._sockets = new Map();
     this._isRecording = false;
 
@@ -79,20 +83,13 @@ class WebSocketController extends EventEmitter {
    *   url?: string | RegExp,
    *   state?: 'connecting' | 'open' | 'closed' | 'error'
    * }} [filter]
-   * @returns {Array<object>}
+   * @returns {WsSocket[]}
    */
   getSockets(filter = {}) {
     const list = Array.from(this._sockets.values());
-    return list.filter((sock) => {
-      if (filter.url) {
-        const matches = matchesQuery(sock.url, filter.url);
-        if (!matches) return false;
-      }
-      if (filter.state && sock.state !== filter.state) {
-        return false;
-      }
-      return true;
-    });
+    return list.filter((sock) =>
+      (!filter.url || matchesQuery(sock.url, filter.url)) &&
+      (!filter.state || sock.state === filter.state));
   }
 
   /**
@@ -104,14 +101,15 @@ class WebSocketController extends EventEmitter {
    *   query?: string | RegExp,
    *   jsonOnly?: boolean
    * }} [filter]
-   * @returns {Array<object>}
+   * @returns {WsFrame[]}
    */
   getFrames(socketIdOrUrl, filter = {}) {
+    /** @type {WsSocket[]} */
     let sockets = [];
 
     if (socketIdOrUrl) {
       if (this._sockets.has(socketIdOrUrl)) {
-        sockets = [this._sockets.get(socketIdOrUrl)];
+        sockets = [this._sockets.get(socketIdOrUrl)].filter((sock) => sock !== undefined);
       } else {
         sockets = this.getSockets({ url: socketIdOrUrl });
       }
@@ -147,7 +145,7 @@ class WebSocketController extends EventEmitter {
    * Crucial for finding auth tokens, signatures, or specific API payloads in live WS traffic.
    * @param {string | RegExp} query
    * @param {{ direction?: 'sent' | 'received' }} [options]
-   * @returns {Array<{ socketId: string, url: string, frame: object }>}
+   * @returns {Array<{ socketId: string, url: string, frame: WsFrame }>}
    */
   searchFrames(query, options = {}) {
     const frames = this.getFrames(undefined, {
@@ -165,9 +163,15 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /**
+   * @param {string} requestId
+   * @param {string} [url]
+   * @returns {WsSocket}
+   */
   _getOrCreateSocket(requestId, url = '') {
-    if (!this._sockets.has(requestId)) {
-      this._sockets.set(requestId, {
+    let sock = this._sockets.get(requestId);
+    if (!sock) {
+      sock = {
         requestId,
         url,
         initiator: null,
@@ -177,14 +181,16 @@ class WebSocketController extends EventEmitter {
         state: 'connecting',
         frames: [],
         errorMessage: null,
-      });
+      };
+      this._sockets.set(requestId, sock);
     }
-    return this._sockets.get(requestId);
+    return sock;
   }
 
   /**
    * @private
    */
+  /** @param {string} str */
   _tryParseJson(str) {
     if (typeof str !== 'string' || (!str.startsWith('{') && !str.startsWith('['))) {
       return null;
@@ -199,6 +205,7 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.WebSocketCreatedEvent} event */
   _onSocketCreated(event) {
     const sock = this._getOrCreateSocket(event.requestId, event.url);
     sock.url = event.url;
@@ -209,6 +216,7 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.WebSocketWillSendHandshakeRequestEvent} event */
   _onHandshakeReq(event) {
     const sock = this._getOrCreateSocket(event.requestId);
     sock.handshakeRequest = {
@@ -221,6 +229,7 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.WebSocketHandshakeResponseReceivedEvent} event */
   _onHandshakeRes(event) {
     const sock = this._getOrCreateSocket(event.requestId);
     sock.state = 'open';
@@ -236,6 +245,7 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.WebSocketFrameSentEvent} event */
   _onFrameSent(event) {
     const sock = this._getOrCreateSocket(event.requestId);
     // note: attached after the handshake (e.g. a second process on a live tab)
@@ -245,6 +255,7 @@ class WebSocketController extends EventEmitter {
     // exposes a request-id → URL lookup for WebSocket requests.
     if (sock.state === 'connecting' && !sock.handshakeResponse) sock.state = 'open';
     const frameData = event.response;
+    /** @type {WsFrame} */
     const entry = {
       requestId: event.requestId,
       url: sock.url,
@@ -265,10 +276,12 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.WebSocketFrameReceivedEvent} event */
   _onFrameRecv(event) {
     const sock = this._getOrCreateSocket(event.requestId);
     if (sock.state === 'connecting' && !sock.handshakeResponse) sock.state = 'open'; // late attach — see _onFrameSent
     const frameData = event.response;
+    /** @type {WsFrame} */
     const entry = {
       requestId: event.requestId,
       url: sock.url,
@@ -289,6 +302,7 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.WebSocketFrameErrorEvent} event */
   _onFrameError(event) {
     const sock = this._getOrCreateSocket(event.requestId);
     sock.state = 'error';
@@ -302,6 +316,7 @@ class WebSocketController extends EventEmitter {
   /**
    * @private
    */
+  /** @param {import('devtools-protocol').Protocol.Network.WebSocketClosedEvent} event */
   _onSocketClosed(event) {
     const sock = this._getOrCreateSocket(event.requestId);
     sock.state = 'closed';

@@ -26,12 +26,13 @@ const { connect, waitForEvent, waitUntil, assertEventually, startChrome, findChr
 `connect(options)` → `Promise<ChromeClient>`
 
 | Option | Default | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `port` | `9222` | CDP port |
 | `autoLaunch` | `true` | Launches Chrome if the port is not already answering |
 | `browserURL` | `http://127.0.0.1:<port>` | Explicit HTTP endpoint |
 | `browserWSEndpoint` | — | Attach by WebSocket URL instead of port |
 | `autoEnableAll` | `true` | Starts network + websocket + console + sources recording on connect. Set `false` only if you want to enable them selectively |
+| `tab` | `0` | Index into `browser.pages()`: which tab to attach to. Out-of-range throws and points at `node cli.js tabs` |
 | `protocolTimeout` | `30000` | Per-CDP-call timeout in ms. Raise it for `unpackBundle` / `deobfuscateBundle` on large bundles |
 
 ### Waiting
@@ -39,7 +40,7 @@ const { connect, waitForEvent, waitUntil, assertEventually, startChrome, findChr
 Three primitives, following ch. 27 of *Growing Object-Oriented Software, Guided by Tests*. They share one bounded-wait engine; the names exist to keep synchronization and claims apart, because conflating them is how a wait that silently gave up gets reported as an observed absence.
 
 | Function | Purpose | On timeout |
-|---|---|---|
+| --- | --- | --- |
 | `waitForEvent(emitter, eventName, options)` | **Listening.** Subscribe to `client.websocket` / `client.network` / `client.console` and return on the event itself | Resolves with the payloads collected so far |
 | `waitUntil(fn, options)` | **Sampling, synchronization.** Poll for state with no event behind it | Returns the last value observed |
 | `assertEventually(fn, options)` | **Sampling, claim.** The next thing you write depends on this being true | Throws with a diagnostic naming the condition and the last value |
@@ -47,7 +48,7 @@ Three primitives, following ch. 27 of *Growing Object-Oriented Software, Guided 
 Prefer `waitForEvent` when an event exists — it neither lags a poll interval behind nor misses a value that appeared and was replaced between two samples. Emitted events: `frame`, `frameSent`, `frameReceived`, `socketCreated`, `handshakeRequest`, `handshakeResponse`, `socketError`, `socketClosed` (websocket); `request`, `response`, `finished`, `failed` (network); `message`, `exception` (console).
 
 | Option | Default | Applies to | Notes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `timeout` | `20000` | all | Every wait is bounded; there is no unbounded form on purpose |
 | `every` | `300` | the sampling pair | Poll interval |
 | `min` | `1` | the sampling pair | For array/string results, how many items count as ready. `{ min: 10 }` = "wait for enough frames to see the pattern" |
@@ -66,12 +67,11 @@ Also exported: `startChrome({ port })`, `findChromePath()`, `checkCdpReady(port)
 ## client — page level
 
 | Method | Returns | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `newPage({ autoEnableAll })` | `ChromeClient` | New tab with its own CDP session and controllers; shares the worker tracker |
 | `goto(url, options)` | navigation response or `null` | Defaults `waitUntil: 'domcontentloaded'`, `timeout: 15000`. Returns `null` instead of throwing when it times out but the DOM already parsed |
 | `setViewport({ width, height, deviceScaleFactor, isMobile })` | — | Only when you need a specific viewport; an unconditional override puts the tab under Emulation, which can stop background frame production |
 | `title()` / `content()` / `url()` | `string` | Rendered title / full HTML / current URL (sync). `url()` is the truth after redirects — not the URL you passed to `goto()` |
-| `screenshot({ path, fullPage })` | buffer | Removed from the CLI — an LLM agent reads DOM, not images. `client.page.screenshot()` still exists in puppeteer; beware: a minimized Chrome window suspends compositing and the capture hangs (only `Browser.setWindowBounds('normal')` revives it) |
 | `evaluate(expressionOrFn, ...args)` | value | Runs in page context |
 | `toMarkdown(options)` | `{ title, markdown, ... }` | Readability + Turndown GFM |
 | `toCheerio()` | CheerioAPI | Rendered DOM, not the raw served HTML |
@@ -90,7 +90,7 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 **Interaction** (needed for anything behind a login or a click):
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `interactiveSnapshot(selector?)` | Compact list of the interactive elements (buttons, links, inputs, `role=button`, …) **currently visible** — tag, id, text, href, placeholder, value, disabled, `inViewport` — plus `{ url, readyState, count }`. The agent's eyes: read it before acting and after every action, and pick selectors from it, never from memory |
 | `click(selector, options)` | Scrolls into view and clicks (DOM-level, works in background windows) |
 | `clickByText(text)` | Human-style: matches an interactive element by visible text (exact beats substring, case-insensitive); returns what was clicked, `null` if nothing matched |
@@ -106,7 +106,7 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 **Audit:**
 
 | Method | Returns |
-|---|---|
+| --- | --- |
 | `getEventListeners(target = 'window')` | Listeners via CDP `DOMDebugger`, each with `type`, `scriptId`, `lineNumber`, `columnNumber`, `useCapture`. `target` is a selector or the literal `'window'` |
 | `dumpForms()` | Every form: action, method, and all inputs including hidden ones |
 | `dumpHiddenInputs()` | `type=hidden` **and** CSS-hidden elements |
@@ -120,7 +120,7 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 ## client.network — NetworkController
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `startRecording()` / `stopRecording()` / `clear()` | Recording is already on after `connect()` unless `autoEnableAll: false` |
 | `getTraffic(filter)` | Filter: `url` (string/RegExp), `method`, `resourceType`, `status`, `failedOnly` |
 | `getRequestPostData(query)` | Raw request body |
@@ -129,8 +129,8 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 | `toRawResponse(query)` | Same, for the response |
 | `searchTraffic(query)` | Scans URL + headers + request postData across every recorded request |
 | `searchBodies(query, { requestId })` | Searches response bodies. Hybrid: native `Network.searchInResponseBody` first; entries Chrome can't search natively (durable-stored, evicted) fall back to a local match over `getResponseBody`. Accepts a substring, or `/pattern/flags` / a RegExp |
-| `getCookies(urls)` |
-| `replayXHR(requestId)` | Resends the XHR identical to the original (method, url, body, headers); the replay is recorded like any other request |
+| `getCookies(urls)` | Cookies for the given URLs; omit for the current page |
+| `replayXHR(requestId)` | Resends the XHR identical to the original (method, url, body, headers); the replay is recorded like any other request. **Only XHR requests can be replayed**: Chrome rejects `fetch()` requests with "Given id does not correspond to XHR" (observed in development, not covered by an automated test) |
 | `clearCache()` / `clearCookies()` | Useful to force a cold load |
 
 `query` for the per-request methods is a `requestId` string, a URL substring, a RegExp, or `{ url }` / `{ requestId }`.
@@ -142,9 +142,9 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 ## client.websocket — WebSocketController
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `startRecording()` / `stopRecording()` / `clear()` | |
-| `getSockets(filter)` | Filter: `url`, `state` (`connecting` \| `open` \| `closed` \| `error`). Each socket carries handshake headers and its `frames` array |
+| `getSockets(filter)` | Filter: `url`, `state` (`connecting` \| `open` \| `closed` \| `error`). Each socket carries handshake headers and its `frames` array. **Limitation** (observed in development): when a navigation tears a socket down, Chrome sent no `webSocketClosed` in our tests, so the record stays `open` with no `endTime` |
 | `getFrames(socketIdOrUrl, filter)` | Omit the first argument for all sockets. Filter: `direction` (`sent` \| `received`), `opcode`, `query`, `jsonOnly` (only frames that parsed as JSON — `frame.parsedJson` holds the object) |
 | `searchFrames(query, { direction })` | `{ socketId, url, frame }[]` across every connection |
 
@@ -155,7 +155,7 @@ Frames only exist after the handshake, and many only appear in response to inter
 ## client.console — ConsoleController
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `startRecording()` / `stopRecording()` / `clear()` | |
 | `getLogs(filter)` | Filter: `type` (`log`, `error`, `warning`, …), `query`, `hasStackTrace`. Entries carry the full call stack with file, line, and column |
 | `evaluate(expressionOrFn, ...args)` | Via CDP `Runtime.evaluate`, returns the unwrapped value |
@@ -167,7 +167,7 @@ Frames only exist after the handshake, and many only appear in response to inter
 ## client.sources — SourceController
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `enable()` / `disable()` / `clear()` | |
 | `getScripts(filter)` | Filter: `url` (string/RegExp), `excludeInternal` (drops `pptr:` and `chrome-extension:`). Entries: `scriptId`, `url`, line/column range, `hash`, `sourceMapURL` |
 | `getScriptSource(scriptIdOrUrl)` | `{ source, ... }` |
@@ -184,7 +184,7 @@ Frames only exist after the handshake, and many only appear in response to inter
 ## client.debug — DebugController
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `enable({ pauseOnExceptions, asyncStackDepth })` | `pauseOnExceptions`: `true` (= `'all'`) or spec enum `'caught'` \| `'uncaught'` \| `'all'` — Debugger.setPauseOnExceptions state, validated. Armed state is re-sent on `Runtime.executionContextsCleared` because a reload wipes it on some stacks — arm *after* `goto()` when the pause must apply to the fresh load |
 | `setBreakpoint(url, lineNumber, columnNumber = 0, condition)` | `condition` is a JS expression — the breakpoint only fires when it is truthy. Raw protocol semantics: `lineNumber` counts from the top of the *document*, so for an inline `<script>` starting at document line N add N (the script's `startLine` from `getScripts()`). The CLI `break` command does this offset for you — pass script-relative lines there |
 | `removeBreakpoint(breakpointId)` | Untracks the id on success (a throw keeps it tracked so `disable()` retries the removal) |
@@ -201,7 +201,7 @@ Protocol reference (vendored, update with `git -C references/devtools-protocol p
 ## client.workers — WorkerController
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `list()` | `{ id, type, url }[]` for dedicated, shared, and service workers |
 | `info(item)` | |
 | `evaluate(id, expression, options)` | Runs inside the worker's own scope, e.g. `'self.location.href'` |
@@ -214,12 +214,27 @@ Worth checking when a site's crypto or network code is not in the main bundle �
 ## client.performance — PerformanceController
 
 | Method | Notes |
-|---|---|
+| --- | --- |
 | `metrics()` | CDP `Performance.getMetrics` snapshot |
 | `startTrace(options)` / `stopTrace()` | Returns Chrome trace JSON — load it in `chrome://tracing` or the DevTools Performance panel to find long tasks, layout thrash, and CPU-heavy frames |
 | `measure(fn, ...args)` | Runs `fn` in the page and returns its result alongside timing |
 
 ---
+
+## client.visual — VisualController
+
+For canvas games and iframes. Games draw on `<canvas>` inside an iframe, so the DOM controller has no selectors to click. Use `snapshot` first: it lists each frame's URL, canvases (index, size) and interactive elements.
+
+| Method | Notes |
+| --- | --- |
+| `frames()` | Child frames of the page (main frame excluded) |
+| `frame(spec)` | First child frame. `spec` is an index into `frames()`, a URL substring (a Git Bash `C:/Program Files/Git/` prefix is stripped), or a RegExp. Throws with the first frame URLs when none match |
+| `preserveWebGL()` | Installs a hook so WebGL canvases keep their drawing buffer. Applies to documents created after the call: reload the page. The CLI `canvas --preserve` does both |
+| `click(x, y, { frame, button, clickCount })` | Real mouse events via `Input.dispatchMouseEvent`. With `frame`, `x`/`y` are relative to the iframe's top-left. Waits up to 3 s for network idle first: a click sent right after a load is silently dropped |
+| `key(code, { holdMs })` | `keyDown`, wait `holdMs`, `keyUp` for a KeyboardEvent `code` (`KeyW`, `Space`, `ArrowLeft`, `Digit1`, …). Goes to the focused element — click the game first. Held keys are needed for movement; a tap is `holdMs: 0` |
+| `canvas({ frame, index })` | `{ width, height, dataUrl }` of the nth canvas in the frame. Fails with the browser's error when tainted. WebGL canvases read blank unless the app sets `preserveDrawingBuffer` |
+
+**Limit:** text drawn on a canvas is invisible to `snapshot`. To learn what a game shows you need its app state (an `eval` into the frame) or the pixels (`canvas --out`).
 
 ## Shared conventions
 
@@ -236,7 +251,7 @@ Worth checking when a site's crypto or network code is not in the main bundle �
 `node cli.js --help` prints the authoritative list. Each command attaches to the live tab and **leaves it open** — page state (logins, SPA routes, WebSocket sessions) survives between commands, and you or the user close tabs by hand (`close`, or the X button). A command navigates only when given a URL; omit it and the command reads the page as it currently is.
 
 | Command | Notes |
-|---|---|
+| --- | --- |
 | `start` | Launch Chrome with remote debugging |
 | `close` | Close the current tab; falls back to `about:blank` when it is the last tab so Chrome stays up |
 | `markdown [url] [destFile]` | Clean article text as GFM |
@@ -257,6 +272,12 @@ Worth checking when a site's crypto or network code is not in the main bundle �
 | `traffic [url] [--bodies] [--wait S]` | With a URL: navigate, wait for network idle, then for the first WS frame; capture the load. Without: attach to the live tab and record `--wait S` (default 5) while the user interacts — no navigation, WebSocket state undisturbed. `--bodies` drains each response body into the result (redirect hops, 204/no-cors beacons and evicted bodies appear as a `(...)` note, never silently `null`) |
 
 **Late WebSocket attach.** A process that connects to a tab whose WebSocket was opened earlier misses the handshake — no socket URL is recoverable, so such sockets appear with `url: ''` (state corrected to `open`, since frames are flowing) and `traffic` adds a `note`. Frames on them still arrive and are searchable; to get the URL and handshake, load the page in the capturing process (`traffic <url>`).
-| `eval [url] <expression>` | With a URL: navigate, then evaluate — self-contained. Without: runs against the currently open tab and leaves it open, so follow-up `eval`s inherit page state (logins, SPA routes). Objects print as JSON, not `[object Object]` |
+| `click-at <x> <y> [--frame U]` | Mouse click at coordinates; with `--frame`, relative to the iframe whose URL contains `U` |
+| `key <code> [--hold MS]` | Hold a key on the focused element (`KeyW`, `Space`, `ArrowLeft`) |
+| `tabs` | Open tabs: `tab` index, `url`, `title`, `active` |
+| `frames` | Child iframes: `frame` index, canvas count, element count, url |
+| `canvas [--frame U] [--index N] [--out F.png] [--preserve]` | Canvas size; with `--out`, the pixels as PNG. `--preserve` reloads the tab first (the game restarts) so WebGL reads back |
+| `clean` | Deletes the scratch folder `.tmp/` inside the skill |
+| `eval [url] <expression> [--frame U]` | With a URL: navigate, then evaluate — self-contained. Without: runs against the currently open tab and leaves it open, so follow-up `eval`s inherit page state (logins, SPA routes). Objects print as JSON, not `[object Object]` |
 
-Global flags: `--port <n>`, `--json`, `--out <file>` (JSON-producing commands write to the file instead of stdout — parent dirs are created; stdout gets the path + size), `--help`.
+Global flags: `--port <n>`, `--tab <n>` (attach to tab N instead of 0), `--json`, `--out <file>` (JSON-producing commands write to the file instead of stdout — parent dirs are created; stdout gets the path + size), `--help`.
