@@ -18,6 +18,62 @@ const { gfm } = require('turndown-plugin-gfm');
 /** The page window with the state that hookPostMessage keeps on it. */
 /** @typedef {Window & { __postMessageHookInstalled?: boolean, __postMessageLogs: PostMessageLog[] }} HookedWindow */
 
+// Page-side functions: puppeteer serializes the function it is given, so each one must be self-contained
+// (it cannot call its neighbours) — that is why the interactive-element selector is repeated where needed.
+
+/**
+ * Runs in the page. Scrolls the element into view and reports why it cannot be acted on.
+ * @param {Node} node
+ * @returns {string} '' when the element is actionable, else the reason
+ */
+function refusalReasonInPage(node) {
+  const el = /** @type {HTMLElement & { disabled?: boolean }} */ (node);
+  if (typeof el.scrollIntoView === 'function') {
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+  }
+  if (el.disabled) return 'disabled';
+  const r = el.getBoundingClientRect();
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (hit && hit !== el && !el.contains(hit)) {
+    const label = hit.id ? '#' + hit.id : '';
+    return 'covered by <' + hit.tagName.toLowerCase() + label + '>';
+  }
+  return '';
+}
+
+/**
+ * Runs in the page: focus and click at DOM level, because a pointer click waits on IntersectionObserver
+ * in background windows.
+ * @param {Node} node
+ */
+function domClickInPage(node) {
+  const el = /** @type {HTMLElement} */ (node);
+  if (typeof el.focus === 'function') {
+    el.focus();
+  }
+  el.click();
+}
+
+/**
+ * Runs in the page: the interactive element whose visible text matches (exact beats substring).
+ * @param {string} target
+ * @returns {Element | null}
+ */
+function findTextElementInPage(target) {
+  const SELECTOR = 'a, button, [role=button], [role=tab], [onclick], summary, input[type=submit], input[type=button]';
+  const norm = (/** @type {string | null | undefined} */ s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = norm(target);
+  let exact = null, partial = null;
+  for (const el of /** @type {NodeListOf<FormLikeElement>} */ (document.querySelectorAll(SELECTOR))) {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    const t = norm(el.innerText || el.value);
+    if (t === want) { exact = el; break; }
+    if (!partial && t.includes(want)) partial = el;
+  }
+  return exact || partial;
+}
+
 class DOMController {
   /**
    * @param {import('puppeteer-core').Page} page
@@ -79,16 +135,18 @@ class DOMController {
       const root = scope ? document.querySelector(scope) : document;
       if (!root) return null;
       const clean = (/** @type {string | null | undefined} */ s, /** @type {number} */ n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
-      const seen = new Set();
+      // No dedupe by tag+id+text: querySelectorAll returns each element once, so such a key can only
+      // collapse distinct elements (two unnamed inputs with no text look identical).
       const elements = [];
+      let matched = 0;
       for (const el of /** @type {NodeListOf<FormLikeElement>} */ (root.querySelectorAll(SELECTOR))) {
         const cs = getComputedStyle(el);
         if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        // count reports every interactive element; the list stops at 150 so the reply stays small.
+        matched += 1;
+        if (elements.length >= 150) continue;
         const rect = el.getBoundingClientRect();
         const text = clean(el.innerText || el.value || el.placeholder, 60);
-        const key = el.tagName + '|' + el.id + '|' + text;
-        if (seen.has(key)) continue;
-        seen.add(key);
         elements.push({
           tag: el.tagName.toLowerCase(),
           id: el.id || undefined,
@@ -101,37 +159,37 @@ class DOMController {
           disabled: el.disabled || undefined,
           inViewport: (rect.top < innerHeight && rect.bottom > 0) || undefined,
         });
-        if (elements.length >= 150) break;
       }
-      return { url: location.href, readyState: document.readyState, count: elements.length, elements };
+      return { url: location.href, readyState: document.readyState, count: matched, truncated: matched > elements.length || undefined, elements };
     }, selector || '');
   }
 
   /**
    * Human-style click: find the interactive element whose visible text matches
-   * (exact match wins over substring, case-insensitive) and click it.
+   * (exact match wins over substring, case-insensitive) and click it through the same
+   * disabled/covered check the selector path uses.
    * @param {string} text
    * @returns {Promise<{ tag: string, text: string } | null>} what was clicked, or null if nothing matched
    */
   async clickByText(text) {
-    return this._page.evaluate((target) => {
-      const SELECTOR = 'a, button, [role=button], [role=tab], [onclick], summary, input[type=submit], input[type=button]';
-      const norm = (/** @type {string | null | undefined} */ s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const want = norm(target);
-      let exact = null, partial = null;
-      for (const el of /** @type {NodeListOf<FormLikeElement>} */ (document.querySelectorAll(SELECTOR))) {
-        const cs = getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-        const t = norm(el.innerText || el.value);
-        if (t === want) { exact = el; break; }
-        if (!partial && t.includes(want)) partial = el;
-      }
-      const el = exact || partial;
-      if (!el) return null;
-      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center', inline: 'center' });
-      el.click();
-      return { tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 60) };
-    }, text);
+    const handle = await this._page.evaluateHandle(findTextElementInPage, text);
+    const element = handle.asElement();
+    if (!element) {
+      await handle.dispose();
+      return null;
+    }
+    try {
+      const info = await element.evaluate((node) => {
+        const el = /** @type {HTMLElement & { value?: string }} */ (node);
+        return { tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 60) };
+      });
+      const why = await element.evaluate(refusalReasonInPage).catch(() => '');
+      if (why) throw new Error(`click refused: text=${text} is ${why}. Nothing was clicked.`);
+      await element.evaluate(domClickInPage);
+      return info;
+    } finally {
+      await element.dispose().catch(() => {});
+    }
   }
 
   /**
@@ -159,35 +217,21 @@ class DOMController {
    */
   async click(selector, { timeout, ...clickOptions } = {}) {
     await this._page.waitForSelector(selector, { timeout });
-    // Refuse a silent no-op: a disabled element ignores el.click(), and a covering element takes it instead.
-    /** @type {string | null} empty string = clicked, text = why it was refused, null = evaluate failed */
-    let outcome = null;
-    try {
-      outcome = await this._page.$eval(selector, (node) => {
-        const el = /** @type {HTMLElement & { disabled?: boolean }} */ (node);
-        if (typeof el.scrollIntoView === 'function') {
-          el.scrollIntoView({ block: 'center', inline: 'center' });
-        }
-        if (el.disabled) return 'disabled';
-        const r = el.getBoundingClientRect();
-        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-        if (hit && hit !== el && !el.contains(hit)) {
-          const label = hit.id ? '#' + hit.id : '';
-          return 'covered by <' + hit.tagName.toLowerCase() + label + '>';
-        }
-        if (typeof el.focus === 'function') {
-          el.focus();
-        }
-        el.click();
-        return '';
-      });
-    } catch {
-      outcome = null;
-    }
-    if (outcome === null) {
+    const handle = await this._page.$(selector);
+    if (!handle) {
       await this._page.click(selector, clickOptions);
-    } else if (outcome) {
-      throw new Error(`click refused: ${selector} is ${outcome}. Nothing was clicked.`);
+      return;
+    }
+    try {
+      // Refuse a silent no-op: a disabled element ignores el.click(), and a covering element takes it instead.
+      const why = await handle.evaluate(refusalReasonInPage).catch(() => '');
+      if (why) throw new Error(`click refused: ${selector} is ${why}. Nothing was clicked.`);
+      await handle.evaluate(domClickInPage).catch(async () => {
+        // Detached or stale handle: fall back to a real pointer click.
+        await this._page.click(selector, clickOptions);
+      });
+    } finally {
+      await handle.dispose().catch(() => {});
     }
   }
 
@@ -200,6 +244,11 @@ class DOMController {
    */
   async type(selector, text, { timeout, delay } = {}) {
     await this._page.waitForSelector(selector, { visible: true, timeout });
+    // Same refusal as click: a disabled field ignores the keys, a covered one types into the overlay.
+    const handle = await this._page.$(selector);
+    const why = handle ? await handle.evaluate(refusalReasonInPage).catch(() => '') : '';
+    await handle?.dispose().catch(() => {});
+    if (why) throw new Error(`type refused: ${selector} is ${why}. Nothing was typed.`);
     await this.ensureVisible(); // occluded windows swallow synthesized keys
     await this._page.type(selector, text, { delay });
     // Verify the keys landed; if the revive failed they were dropped silently.

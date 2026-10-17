@@ -92,15 +92,17 @@ function summarizeProfile(profile, labelOf, intervalUs, top = 15) {
  * }} RuntimeDeps
  */
 
+/**
+ * Script labels for this page: the URL, or a content hash for code created at runtime.
+ * @param {Client} client
+ */
+function labelsOf(client) {
+  const labels = new Map(client.sources.getScripts().map((/** @type {import('../source-controller').ScriptInfo} */ s) => [s.scriptId, s.url || (s.hash ? `runtime ${s.hash.slice(0, 12)}` : `runtime ${s.scriptId}`)]));
+  return (/** @type {string} */ scriptId) => labels.get(scriptId) ?? `unknown ${scriptId}`;
+}
+
 /** @param {RuntimeDeps} deps */
 function createRuntimeCommands({ attach, emit, release, isHttpUrl, T }) {
-  /** Script labels for this page: URL, or a content hash for code created at runtime. */
-  /** @param {Client} client */
-  function labelsOf(client) {
-    const labels = new Map(client.sources.getScripts().map((/** @type {import('../source-controller').ScriptInfo} */ s) => [s.scriptId, s.url || (s.hash ? `runtime ${s.hash.slice(0, 12)}` : `runtime ${s.scriptId}`)]));
-    return (/** @type {string} */ scriptId) => labels.get(scriptId) ?? `unknown ${scriptId}`;
-  }
-
   /** @param {Ctx} ctx */
   async function cmdEvents({ args, port, outFile }) {
     const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
@@ -144,4 +146,4 @@ function createRuntimeCommands({ attach, emit, release, isHttpUrl, T }) {
   return { cmdEvents, cmdProfile };
 }
 
-module.exports = { createRuntimeCommands, groupListeners, summarizeProfile };
+module.exports = { createRuntimeCommands };

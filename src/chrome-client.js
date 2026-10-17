@@ -3,7 +3,8 @@
 // .default is the same object as the module (runtime-identical); the bare require loses its typings under NodeNext
 const puppeteer = require('puppeteer-extra').default;
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { PROTOCOL_TIMEOUT_MS, GOTO_TIMEOUT_MS } = require('./timeouts');
+const { PROTOCOL_TIMEOUT_MS, GOTO_TIMEOUT_MS, UNRESPONSIVE_WAIT_MS, CLEANUP_WAIT_MS } = require('./timeouts');
+const { settleWithin, sleep } = require('./util');
 
 const DOMController = require('./dom-controller');
 const NetworkController = require('./network-controller');
@@ -97,28 +98,57 @@ class ChromeClient {
 
     const browser = await puppeteer.connect(connectOpts);
 
-    const pages = await browser.pages();
-    const tab = options.tab ?? 0;
-    if (tab >= pages.length) throw new Error(`Tab ${tab} does not exist: Chrome has ${pages.length} tab(s). List them with: node cli.js tabs`);
-    let page = pages.length > 0 ? pages[tab] : await browser.newPage();
-    if (page.url().startsWith('chrome://')) {
-      await page.goto('about:blank');
-    }
-    const cdp = await page.createCDPSession();
-
-    const workers = await WorkerController.create(browser);
-    const client = new ChromeClient(browser, page, cdp, { workers, ownsWorkers: true });
-
-    if (options.autoEnableAll !== false) {
-      await Promise.all([
-        client.network.startRecording(),
-        client.websocket.startRecording(),
-        client.console.startRecording(),
-        client.sources.enable(),
+    try {
+      // browser.pages() initializes every page, and initializing a page sends Network.enable, which a
+      // blocked renderer never answers: one wedged tab would make every command fail. Listing targets
+      // only reads target info, so initialize the one tab that was asked for, and only for a budget.
+      /** @type {import('puppeteer-core').Target[]} */
+      const allTargets = await browser.targets();
+      const targets = allTargets.filter((target) => target.type() === 'page');
+      const tab = options.tab ?? 0;
+      if (tab >= targets.length) throw new Error(`Tab ${tab} does not exist: Chrome has ${targets.length} tab(s). List them with: node cli.js tabs`);
+      const page = await Promise.race([
+        targets[tab].page().catch(() => null),
+        sleep(UNRESPONSIVE_WAIT_MS).then(() => null),
       ]);
-    }
+      if (!page) {
+        // note: ceiling — close and goto cannot run on a busy-loop tab, because puppeteer needs a page
+        // handle and page setup itself needs the renderer. Upgrade path if this bites again: close via
+        // HTTP /json/close/<id> and goto via Page.navigate on the raw page session from /json/list, both
+        // of which answer while the renderer is blocked (measured: 143 ms and 1.25 s).
+        const error = new Error(`Tab ${tab} (${targets[tab].url()}) is not answering: its renderer is blocked by a synchronous call. Close that tab in Chrome or restart Chrome, then retry.`);
+        error.name = 'UnresponsiveTabError';
+        throw error;
+      }
+      if (page.url().startsWith('chrome://')) {
+        await page.goto('about:blank');
+      }
+      const cdp = await page.createCDPSession();
 
-    return client;
+      const workers = await WorkerController.create(browser);
+      const client = new ChromeClient(browser, page, cdp, { workers, ownsWorkers: true });
+
+      // A blocked renderer never answers these, so wait for them only up to a budget: the command
+      // then runs with the recording it got, instead of failing before it starts (status, close, goto).
+      if (options.autoEnableAll !== false) {
+        await settleWithin(
+          Promise.all([
+            client.network.startRecording(),
+            client.websocket.startRecording(),
+            client.console.startRecording(),
+            client.sources.enable(),
+          ]),
+          UNRESPONSIVE_WAIT_MS,
+          'enabling the recording domains (traffic, events, console, script search will be empty)'
+        );
+      }
+
+      return client;
+    } catch (error) {
+      // The connection is already open: without this, the socket keeps Node alive after the error.
+      await browser.disconnect().catch(() => {});
+      throw error;
+    }
   }
 
   /**
@@ -131,12 +161,16 @@ class ChromeClient {
     const client = new ChromeClient(this.browser, page, cdp, { workers: this.workers });
 
     if (options.autoEnableAll !== false) {
-      await Promise.all([
-        client.network.startRecording(),
-        client.websocket.startRecording(),
-        client.console.startRecording(),
-        client.sources.enable(),
-      ]);
+      await settleWithin(
+        Promise.all([
+          client.network.startRecording(),
+          client.websocket.startRecording(),
+          client.console.startRecording(),
+          client.sources.enable(),
+        ]),
+        UNRESPONSIVE_WAIT_MS,
+        'enabling the recording domains (traffic, events, console, script search will be empty)'
+      );
     }
 
     return client;
@@ -261,8 +295,9 @@ class ChromeClient {
   }
 
   /**
-   * Stops every recording, detaches the debugger (its cleanup sends are awaited
-   * by the caller), and closes the worker tracker if this tab owns it.
+   * Stops every recording, detaches the debugger, and closes the worker tracker if this tab owns it.
+   * The debugger cleanup is bounded: on a blocked renderer it never answers, and detaching the
+   * session removes the pause-exception setting anyway.
    * @returns {Promise<void>}
    */
   _release() {
@@ -271,7 +306,7 @@ class ChromeClient {
     this.console.stopRecording();
     const debugOff = this.debug.disable();
     if (this._ownsWorkers && this.workers) this.workers.close();
-    return debugOff;
+    return settleWithin(debugOff, CLEANUP_WAIT_MS, 'the debugger cleanup').then(() => {});
   }
 
   /**

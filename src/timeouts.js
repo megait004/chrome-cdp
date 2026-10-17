@@ -18,6 +18,11 @@ module.exports = {
   WAIT_TIMEOUT_MS: 20000,
   // Budget for Tracing.end to stream the trace back.
   TRACE_STOP_TIMEOUT_MS: 30000,
+  // How long connect() and status wait for a renderer that is not answering before degrading.
+  // A blocked renderer never answers, so without this every command dies on connect().
+  UNRESPONSIVE_WAIT_MS: 3000,
+  // How long teardown waits for the pause-exception cleanup: detaching the session removes it anyway.
+  CLEANUP_WAIT_MS: 1000,
   // Budgets for Chromium to apply a minimize / restore of an occluded window.
   WINDOW_HIDE_WAIT_MS: 1000,
   WINDOW_SHOW_WAIT_MS: 2000,

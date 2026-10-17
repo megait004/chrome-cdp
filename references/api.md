@@ -12,6 +12,7 @@ Complete surface of `connect()` and its controllers. `SKILL.md` covers the commo
 - [client.debug](#clientdebug--debugcontroller)
 - [client.workers](#clientworkers--workercontroller)
 - [client.performance](#clientperformance--performancecontroller)
+- [client.visual](#clientvisual--visualcontroller)
 - [Shared conventions](#shared-conventions)
 - [CLI commands](#cli-commands)
 
@@ -35,9 +36,19 @@ const { connect, waitForEvent, waitUntil, assertEventually, startChrome, findChr
 | `tab` | `0` | Index into `browser.pages()`: which tab to attach to. Out-of-range throws and points at `node cli.js tabs` |
 | `protocolTimeout` | `30000` | Per-CDP-call timeout in ms. Raise it for `unpackBundle` / `deobfuscateBundle` on large bundles |
 
+`connect()` opens the browser connection first and then starts the controllers. A failure after that point disconnects
+before rethrowing, so nothing is left open. Two caveats for scripts of your own:
+
+- A failure *inside* `puppeteer.connect()` itself (a `Target.getBrowserContexts` or `Network.enable` timeout on a busy
+  page) can leave its socket open with no handle to close: the error prints and then the process can sit idle
+  instead of exiting. The CLI exits explicitly with its status in that case; a `.tmp/` script that must end should
+  say so itself (`process.exitCode` plus an explicit exit after the error is printed).
+- `disconnect()` leaves Chrome running — only the script's breakpoints and recordings go with the session, which is
+  why a breakpoint armed in one command cannot be hit by the next.
+
 ### Waiting
 
-Three primitives, following ch. 27 of *Growing Object-Oriented Software, Guided by Tests*. They share one bounded-wait engine; the names exist to keep synchronization and claims apart, because conflating them is how a wait that silently gave up gets reported as an observed absence.
+Three primitives share one bounded-wait engine. The names keep synchronization and claims apart: a wait that gave up must not be reported as an observed absence.
 
 | Function | Purpose | On timeout |
 | --- | --- | --- |
@@ -91,7 +102,7 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 
 | Method | Notes |
 | --- | --- |
-| `interactiveSnapshot(selector?)` | Compact list of the interactive elements (buttons, links, inputs, `role=button`, …) **currently visible** — tag, id, text, href, placeholder, value, disabled, `inViewport` — plus `{ url, readyState, count }`. The agent's eyes: read it before acting and after every action, and pick selectors from it, never from memory |
+| `interactiveSnapshot(selector?)` | Compact list of the interactive elements (buttons, links, inputs, `role=button`, …) **currently visible** — tag, id, text, href, placeholder, value, disabled, `inViewport` — plus `{ url, readyState, count, truncated }` — `count` is every interactive element, `elements` stops at 150 and `truncated: true` says the list was cut. The agent's eyes: read it before acting and after every action, and pick selectors from it, never from memory |
 | `click(selector, options)` | Scrolls into view and clicks (DOM-level, works in background windows) |
 | `clickByText(text)` | Human-style: matches an interactive element by visible text (exact beats substring, case-insensitive); returns what was clicked, `null` if nothing matched |
 | `type(selector, text, options)` | Keystroke-by-keystroke; fires the events a real user would. Revives an occluded window first (`visibilityState: 'hidden'` makes Chromium drop synthesized keys entirely — a minimize→normal dance is the only revival; `bringToFront` does nothing). Self-verifying: if the keys still did not land, it falls back to `Input.insertText` (delivered even occluded; replaces the field, fires `input` only — no keydown/keyup) |
@@ -130,7 +141,7 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 | `searchTraffic(query)` | Scans URL + headers + request postData across every recorded request |
 | `searchBodies(query, { requestId })` | Searches response bodies. Hybrid: native `Network.searchInResponseBody` first; entries Chrome can't search natively (durable-stored, evicted) fall back to a local match over `getResponseBody`. Accepts a substring, or `/pattern/flags` / a RegExp |
 | `getCookies(urls)` | Cookies for the given URLs; omit for the current page |
-| `replayXHR(requestId)` | Resends the XHR identical to the original (method, url, body, headers); the replay is recorded like any other request. **Only XHR requests can be replayed**: Chrome rejects `fetch()` requests with "Given id does not correspond to XHR" (observed in development, not covered by an automated test) |
+| `replayXHR(requestId)` | Resends the XHR identical to the original (method, url, body, headers); the replay is recorded like any other request. **Only XHR requests can be replayed**: Chrome rejects `fetch()` requests with "Given id does not correspond to XHR" |
 | `clearCache()` / `clearCookies()` | Useful to force a cold load |
 
 `query` for the per-request methods is a `requestId` string, a URL substring, a RegExp, or `{ url }` / `{ requestId }`.
@@ -144,7 +155,7 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 | Method | Notes |
 | --- | --- |
 | `startRecording()` / `stopRecording()` / `clear()` | |
-| `getSockets(filter)` | Filter: `url`, `state` (`connecting` \| `open` \| `closed` \| `error`). Each socket carries handshake headers and its `frames` array. **Limitation** (observed in development): when a navigation tears a socket down, Chrome sent no `webSocketClosed` in our tests, so the record stays `open` with no `endTime` |
+| `getSockets(filter)` | Filter: `url`, `state` (`connecting` \| `open` \| `closed` \| `error`). Each socket carries handshake headers and its `frames` array. **Limitation:** when a navigation tears a socket down, no `webSocketClosed` arrives, so the record stays `open` with no `endTime` |
 | `getFrames(socketIdOrUrl, filter)` | Omit the first argument for all sockets. Filter: `direction` (`sent` \| `received`), `opcode`, `query`, `jsonOnly` (only frames that parsed as JSON — `frame.parsedJson` holds the object) |
 | `searchFrames(query, { direction })` | `{ socketId, url, frame }[]` across every connection |
 
@@ -197,7 +208,7 @@ Frames only exist after the handshake, and many only appear in response to inter
 
 Emits `paused` with `{ callFrames, reason }`, and `client.debug.paused` holds that same payload (or `null`) if you would rather poll than subscribe. The page is frozen until `resume()`, so always resume — including on the error path.
 
-Protocol reference (vendored, update with `git -C references/devtools-protocol pull`): `references/devtools-protocol/json/js_protocol.json`, domain `Debugger` — full parameter shapes for `setBreakpointByUrl`, `evaluateOnCallFrame`, `setPauseOnExceptions`, stepping, etc. Prefer the CLI `break` command over raw calls: one shot sets the breakpoint, waits for the hit, captures the stack, evaluates on the top frame (`--eval`), and resumes. Multi-step flows (stepOver/stepInto in a loop, conditional re-pausing) cannot span CLI invocations — pause state dies with the CDP session — so write a `.tmp/` script against `client.debug` for those.
+Protocol reference (installed with the `devtools-protocol` dependency by `npm install`): `node_modules/devtools-protocol/json/js_protocol.json`, domain `Debugger` — full parameter shapes for `setBreakpointByUrl`, `evaluateOnCallFrame`, `setPauseOnExceptions`, stepping, etc. Prefer the CLI `break` command over raw calls: one shot sets the breakpoint, waits for the hit, captures the stack, evaluates on the top frame (`--eval`), and resumes. Multi-step flows (stepOver/stepInto in a loop, conditional re-pausing) cannot span CLI invocations — pause state dies with the CDP session — so write a `.tmp/` script against `client.debug` for those.
 
 ---
 
@@ -256,7 +267,7 @@ For canvas games and iframes. Games draw on `<canvas>` inside an iframe, so the 
 | Command | Notes |
 | --- | --- |
 | `start` | Launch Chrome with remote debugging |
-| `close` | Close the current tab; falls back to `about:blank` when it is the last tab so Chrome stays up |
+| `close` | Close the current tab; falls back to `about:blank` when it is the last tab so Chrome stays up. Not possible on a tab whose renderer is blocked by a synchronous call (`status` reports it as not answering): close that tab in Chrome's UI or restart Chrome |
 | `markdown [url] [destFile]` | Clean article text as GFM |
 | `dump-forms [url]` | Forms + hidden inputs as JSON |
 | `dump-storage [url]` | localStorage, sessionStorage, cookies |
@@ -265,13 +276,14 @@ For canvas games and iframes. Games draw on `<canvas>` inside an iframe, so the 
 | `download-bundle [url] <queryOrId> <destFile>` | |
 | `deobfuscate [url] <queryOrId> [destFile]` | Prints to stdout when `destFile` is omitted |
 | `unpack [url] <queryOrId> <destDir>` | |
-| `ast-search [url] <queryOrId> <pattern>` | Runs on the raw script text: deobfuscate first if the calls go through a string table |
-| `catch-script [url] [--min-bytes N] [--break-line N] [--break-col N] [--eval <expr>] [--frame N] [--timeout S]` | Catches a script **before it runs** (instrumentation breakpoint) and reports it with the stack, so a payload the page built at runtime is caught even though it has no URL: `script` = scriptId, url, character length, first 120 chars; `frames` = the stack, where frame 0 is the new script and frame 1 is the code that created it; `callerExcerpt` = the 200 chars before and 300 after the call site, which is where the decode call sits. `--min-bytes N` skips anything smaller, so `--min-bytes 2000000` lands on a multi-megabyte payload. At this pause only sources are readable (see `setInstrumentationBreakpoint`). With `--break-line N` it then arms a breakpoint by scriptId inside that script, resumes, waits for its own hit, and reports `locals` (frame 0), `callerLocals` (frame 1 — the decoder's own variables) and `evaluated` (`--eval`, on `--frame N`, default 0) |
+| `ast-search [url] <queryOrId> <pattern>` | Runs on the raw script text: deobfuscate first if the calls go through a string table. The pattern must be **statement-shaped**: a bare expression like `"ws_bin" + $A` is parsed as an expression statement and matches nothing, while `throw new $A($B)` matches. Webcrack's unminify folds and re-splits statements, so a pattern copied out of the beautified copy can miss the live text — check it against the raw script. Each hit carries `range.start.column` and `range.start.index`; **use the column** (0-based, same unit as `--col` and `break`), because for a Function-constructor script the index includes the wrapper offset |
+| `catch-script [url] [--min-bytes N] [--max-bytes N] [--only-runtime] [--break-line N] [--break-col N] [--eval <expr>] [--frame N] [--timeout S]` | Catches a script **before it runs** (instrumentation breakpoint) and reports it with the stack, so a payload the page built at runtime is caught even though it has no URL: `script` = scriptId, url, character length, first 120 chars; `frames` = the stack, where frame 0 is the new script and frame 1 is the code that created it; `callerExcerpt` = the 200 chars before and 300 after the call site, which is where the decode call sits. Target it with `--min-bytes`/`--max-bytes` (character bounds, on the length Chrome reports at parse time) and `--only-runtime` (scripts whose url is empty, so an inline HTML block of the same size does not win). `--break-line N` must exist in the caught script, and is rejected with the script's own range otherwise (Chrome's reply is a bare `Could not resolve breakpoint`). **Size and position units:** `--min-bytes`/`--max-bytes` count UTF-16 code units — the same number `vm-scripts` prints and `getScriptSource().length` returns — not file bytes, so a script with non-ASCII identifiers is bigger on disk than the window that matched it (`download-bundle` writes UTF-8). Lines and columns are the script's own when it starts at line 0; for an inline `<script>` block (`startLine > 0`) they are the document's lines and that line's columns, so pass its start line and leave `--break-col` off to default to the script's start column. With `--break-line N` it then arms a breakpoint by scriptId inside that script, resumes, waits for its own hit, and reports `locals` (frame 0), `callerLocals` (frame 1 — the decoder's own variables) and `evaluated` (`--eval`, on `--frame N`, default 0). `callerExcerpt` marks the call column with `>>>` |
 | `vm-scripts [url]` | Scripts with an empty URL (created by eval/Function). Inline HTML scripts carry the page URL and are not listed: scriptId, start line, line count, `length` (from `Debugger.scriptParsed`, so no transfer), and the first 100 characters. A row whose source cannot be read (WebAssembly, or a cleared context) carries `head: null` and an `error` instead of failing the listing |
 | `layout [url] [--wait S]` | Records style, layout, pre-paint and paint for S seconds (default 5) and prints per stage: count, total ms, and the location that was on the stack (`script:line:col`, 1-based) or `(no script on stack)` with the node name. Interact during the window. Layout and style with a script on the stack were forced by that script (e.g. a read like `offsetWidth` after a write); paint and pre-paint never have one |
 | `events [url]` | Every event listener on the window and in the document tree (`depth -1`, `pierce` for iframes), grouped by event type and handler location (`script:line:col`, 1-based). A snapshot: listeners added later are missing, so run it again after the interaction |
 | `profile [url] [--wait S]` | CPU profile for S seconds (sampling every 1 ms). Per function: `selfMs` (estimate from samples, can be below wall time) and the two callers with the most time. Only the immediate caller is shown |
-| `find-function [url] <queryOrId> <name>` | Lines defining `function NAME(` or `NAME = function`. Text match, not a parse; each line cut to 300 characters. A definition is not preceded by an identifier character, so `weird` does not match inside `$weird`; identifiers built from non-ASCII lookalikes can still match partly, so confirm the line |
+| `find-function [url] <queryOrId> <name>` | Lines defining `function NAME(` or `NAME = function`, with the column of the start of the declaration (`async function NAME` reports the `async`, so a hand measurement agrees). The column is derived from the line text, since `Debugger.searchInContent` reports none. Text match, not a parse; each line cut to 300 characters. A definition is not preceded by an identifier character, so `weird` does not match inside `$weird`; identifiers built from non-ASCII lookalikes can still match partly, so confirm the line |
+| `snippet [url] <queryOrId> <line> [--col N] [--before N] [--after N]` | Prints the characters around a position, with `>>>` marking the column (defaults: 200 before, 300 after), plus `lineLength` and `totalLines`. A minified script is one line of a million characters, so a position can only be read as a window; use it with the line and column from `find-function`, or the `callerExcerpt` marker from `catch-script` |
 | `snapshot [url] [selector]` | Compact interactive-element list of the live tab (`--out` for the full list) — read before and after every action |
 | `click [url] <sel\|text=Text>` | Click + DOM delta (`urlChanged`, `added`, `removedCount`). `text=Label` matches by visible text |
 | `type [url] <sel> <text>` | Keystrokes + `valueAfter` echo + `valueMismatch` flag (focus-steal guard) + delta |
@@ -283,7 +295,7 @@ For canvas games and iframes. Games draw on `<canvas>` inside an iframe, so the 
 **Late WebSocket attach.** A process that connects to a tab whose WebSocket was opened earlier misses the handshake — no socket URL is recoverable, so such sockets appear with `url: ''` (state corrected to `open`, since frames are flowing) and `traffic` adds a `note`. Frames on them still arrive and are searchable; to get the URL and handshake, load the page in the capturing process (`traffic <url>`).
 | `click-at <x> <y> [--frame U] [--canvas] [--button left\|right\|middle]` | Mouse click. With `--frame`, coordinates are relative to that iframe's top-left. With `--canvas` too, x/y are canvas-relative and the canvas's offset inside the iframe is added (CSS px; scaled canvases unverified) |
 | `key <code> [--hold MS]` | Hold a key on the focused element (`KeyW`, `Space`, `ArrowLeft`). Takes no `--frame` (refused) |
-| `tabs` | Open tabs: `tab` index, `url`, `title`, `active` |
+| `tabs` | Open tabs: `tab` index, `url`, `title`, and `active` = true for the tab the browser is showing (its document reports `visibilityState === 'visible'`; a minimized window shows none), `null` when the tab could not be read (blocked renderer). The `tab` index is the order `tabs` printed in that run — not the order the tabs were created — and it changes when a tab is opened or closed, so run `tabs` again before addressing a tab with `--tab` |
 | `frames` | Child iframes: `frame` index, canvas count, element count, url |
 | `canvas [--frame U] [--index N] [--out F.png] [--preserve]` | Canvas size; with `--out`, the pixels as PNG. `--preserve` reloads the tab first (the game restarts) so WebGL reads back |
 | `clean` | Deletes the scratch folder `.tmp/` inside the skill |

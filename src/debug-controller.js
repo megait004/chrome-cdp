@@ -6,7 +6,7 @@ const path = require('node:path');
 const { messageOf } = require('./util');
 
 // The pause marker lets another CLI command learn that a page is paused. CDP does not replay a pause to a
-// new session (verified), so a command whose Runtime.evaluate hangs can only find the pause through this file.
+// new session, so this file is the only way a later command finds the pause.
 const PAUSE_MARKER = path.join(__dirname, '..', '.tmp', 'paused.json');
 
 /** @param {number} pid @returns {boolean} */
@@ -96,11 +96,9 @@ class DebugController extends EventEmitter {
     this._onResumed = () => { this._paused = null; clearPauseMarker(); this.emit('resumed'); };
     this._pauseState = null; // armed pauseOnExceptions enum; re-asserted after navigation
     this._onContextsCleared = () => {
-      // note: pause-on-exceptions does not reliably survive a navigation —
-      // some stacks wipe it on reload (cf. Lynx caching the state and
-      // re-sending setPauseOnExceptions after reloading), so re-assert the
-      // armed state for the fresh contexts. Harmless when the backend kept
-      // it: same state, sent idempotently.
+      // note: pause-on-exceptions does not reliably survive a navigation — another client caches the state and
+      // re-sends it after reloading, so re-assert the armed state for the fresh contexts. Harmless when the
+      // backend kept it: same state, sent idempotently.
       if (this._enabled && this._pauseState) {
         this._cdp.send('Debugger.setPauseOnExceptions', { state: this._pauseState }).catch((err) => this.emit('warning', `pause-on-exceptions not re-armed after navigation: ${messageOf(err)}`));
       }
@@ -187,10 +185,10 @@ class DebugController extends EventEmitter {
    * @param {number} [columnNumber]
    * @param {string} [condition]
    */
-  async setBreakpointAtLocation(scriptId, lineNumber, columnNumber = 0, condition) {
+  async setBreakpointAtLocation(scriptId, lineNumber, columnNumber, condition) {
     if (!scriptId || !Number.isInteger(lineNumber) || lineNumber < 0) throw new TypeError('scriptId and non-negative lineNumber are required');
     /** @type {import('devtools-protocol').Protocol.Debugger.SetBreakpointRequest} */
-    const params = { location: { scriptId, lineNumber, columnNumber } };
+    const params = { location: { scriptId, lineNumber, columnNumber: columnNumber ?? 0 } };
     if (condition) params.condition = condition;
     const result = await this._cdp.send('Debugger.setBreakpoint', params);
     this._breakpoints.add(result.breakpointId);

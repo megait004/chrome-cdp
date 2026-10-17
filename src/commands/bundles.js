@@ -100,7 +100,6 @@ function createBundleCommands({ attach, emit, release, isHttpUrl, T }) {
 
     const unpackRes = await client.sources.unpackBundle(queryOrId, destDir);
     if (unpackRes.moduleCount === 0) {
-      // webcrack found no webpack/browserify structure; it still wrote the deobfuscated code to the folder
       console.log(`No bundle structure found; saved the deobfuscated code as one file in: ${unpackRes.outputDirectory}`);
     } else {
       console.log(`Successfully unpacked ${unpackRes.moduleCount} modules to: ${unpackRes.outputDirectory}`);
@@ -154,6 +153,7 @@ function createBundleCommands({ attach, emit, release, isHttpUrl, T }) {
     // Minified bundles put a whole module on one line, so cut each line for the terminal; eval reads the rest.
     const matches = (await client.sources.findFunction(queryOrId, name)).map((m) => ({
       lineNumber: m.lineNumber,
+      column: m.column,
       lineContent: m.lineContent.length > 300 ? `${m.lineContent.slice(0, 300)}…` : m.lineContent,
     }));
     await emit({ name, count: matches.length, matches }, outFile);
@@ -161,7 +161,36 @@ function createBundleCommands({ attach, emit, release, isHttpUrl, T }) {
     await release(client);
   }
 
-  return { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch, cmdVmScripts, cmdFindFunction };
+  /** @param {Ctx} ctx */
+  async function cmdSnippet({ args, port, outFile }) {
+    const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+    const queryOrId = url ? args[2] : args[1];
+    const lineArg = url ? args[3] : args[2];
+    const line = Number(lineArg);
+    const flag = (/** @type {string} */ name) => { const at = args.indexOf(name); return at > 0 ? args[at + 1] : null; };
+    const colArg = flag('--col');
+    const beforeArg = flag('--before');
+    const afterArg = flag('--after');
+    const column = colArg === null ? 0 : Number(colArg);
+    const before = beforeArg === null ? 200 : Number(beforeArg);
+    const after = afterArg === null ? 300 : Number(afterArg);
+    if (!queryOrId || !Number.isInteger(line) || line < 0) {
+      throw new Error('Usage: node cli.js snippet [url] <queryOrId> <line> [--col N] [--before N] [--after N]');
+    }
+    if (!Number.isFinite(column) || column < 0) throw new Error('--col expects a 0-based column');
+    if (!Number.isFinite(before) || before < 0 || !Number.isFinite(after) || after < 0) throw new Error('--before/--after expect a character count');
+
+    const client = await attach(port);
+    if (url) await client.goto(url);
+
+    // A minified file is one huge line, so this is how a position in it gets read at all.
+    const window = await client.sources.readAround(queryOrId, line, column, before, after);
+    await emit(window, outFile);
+
+    await release(client);
+  }
+
+  return { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch, cmdVmScripts, cmdFindFunction, cmdSnippet };
 }
 
 module.exports = { createBundleCommands };

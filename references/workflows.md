@@ -37,6 +37,51 @@ parse(Lang.JavaScript, fs.readFileSync('.tmp/bundle.clean.js', 'utf8')).root().f
 
 For webpack or browserify bundles, `client.sources.unpackBundle(hit.scriptId, './.tmp/modules/')` splits them into modules first.
 
+### Custom string table (Obfuscator.io-style)
+
+When a bundle resolves its strings at runtime — `const t=[...]; function d(i){return t[i-0x10]}` or a packed blob decoded
+by a slice — webcrack cannot help and every text search returns zero for real names, because the name is not text in the
+file. The module can resolve itself: run its own body in an isolated VM and call its own decoder.
+
+```javascript
+const vm = require('node:vm');
+const fs = require('node:fs');
+const source = fs.readFileSync('.tmp/bundle.raw.js', 'utf8');
+
+// The body is a Function body (that is how the page built it), so it may hold a top-level `return`: wrap it as one.
+// Give the sandbox the globals the module reads. A missing one surfaces as a confusing
+// "Cannot read properties of undefined", so add them until the body runs to its end.
+const sandbox = { globalThis, Reflect, Object, Array, String, Number, JSON, Math, Date, TextDecoder, TextEncoder };
+sandbox.window = sandbox; sandbox.self = sandbox; sandbox.global = sandbox;
+const context = vm.createContext(sandbox);
+vm.runInContext(`(${source})`, context);          // or: new Function(source).call(sandbox)
+
+// Then call the module's own decoder on the table. Find the two names first: search the raw text for
+// "+"-joined tables or the decode helper the table is passed to.
+const strings = vm.runInContext('(() => { const out = {}; for (const [k, v] of table) out[k] = decode(v); return out; })()', context);
+```
+
+Write the result out (`strings.json`) together with a copy of the module where each lookup is replaced by its string
+(`decoder.readable.js`). Then `rg`, ast-grep and srcwalk work again, and `snippet` can be pointed at a position.
+Practical notes:
+
+- Register the run's network and crypto as poisoned stubs, not real ones: the module must not fetch or decrypt anything.
+- Guard against a body that throws at the end: run it, catch, and keep whatever it set up before throwing.
+- Keep the decoder's own semantics: a string is usually `table[offset]` into one packed blob with a length, so the
+  pairs are `(offset, length)`, and two different offsets can produce the same string.
+- Verify the rebuild against the live page: pick a string you already saw in a pause and check the same pair maps to it.
+
+Two things learned about `ast-search` on such a payload, both of which produced zero hits for a whole round:
+
+- **The pattern must be statement-shaped.** A bare expression is parsed as an expression *statement*, so it does not
+  match a sub-expression. `throw new $A($B)` finds a call inside a guard; `"ws_bin" + $A` finds nothing.
+- **Do not copy a pattern out of the beautified copy without checking the raw text.** Webcrack's unminify folds and
+  re-splits statements, so `"ws_bin"+"dgen_t"` in the minified file becomes one literal after beautifying, and a
+  `var a=b.length, c;` line can become several declarations.
+
+Take coordinates from the hit's `range.start.column`, not `start.index`: the column is what `--col` and `break` want,
+while the index includes the Function wrapper's offset for a payload built by `new Function`.
+
 ### Script with no URL
 
 A script the page creates at runtime (`eval`, `Function`, a decoded payload) has `url: ''`. CDP still lists it with a scriptId; DevTools names it `VM<id>`.
@@ -64,7 +109,7 @@ Then navigate the unpacked code with `srcwalk discover <symbol>` and `srcwalk tr
 - The recorder keeps running until `mirror stop`. It does not crawl; you drive the interaction.
 - `cookies.json` and `storage.json` hold live session tokens. Do not share or commit them.
 - Known gaps: a shared or service worker is attached after creation, so its first milliseconds can be missed. The Fetch path covers Document responses only. Requests pending at stop are written as `unfinished`.
-- Scout does not resolve webpack numeric module ids. Modules called by id look unused. Confirm any dead-export claim with `rg` on the id.
+- Static analysis does not resolve webpack numeric module ids: a module called by id looks unused. Confirm any dead-export claim with `rg` on the id.
 
 ### Pause and step
 

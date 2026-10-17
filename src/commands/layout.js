@@ -91,4 +91,4 @@ function createLayoutCommands({ attach, emit, release, isHttpUrl, T }) {
   return { cmdLayout, summarizeRender };
 }
 
-module.exports = { createLayoutCommands, summarizeRender };
+module.exports = { createLayoutCommands };

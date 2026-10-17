@@ -2,9 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const os = require('node:os');
 const crypto = require('node:crypto');
-const { execFileSync } = require('node:child_process');
 const { messageOf, sleep } = require('./util');
 const { waitUntil } = require('./waiting');
 
@@ -47,7 +45,6 @@ const { waitUntil } = require('./waiting');
  * @typedef {{ pageUrl: string, requestedUrl: string, navigationError: string | null, files: ManifestFile[], failed: Array<{ url?: string, error?: string | null }>, redirects: number }} Manifest
  */
 
-const SCOUT_PRECISE = path.join(os.homedir(), '.pi', 'agent', 'skills', 'scout', 'scripts', 'precise.mjs');
 const ACTIVE = 'ACTIVE'; // file in outRoot naming the run that is recording now
 const MAX_RECORD_MS = 60 * 60 * 1000; // safety stop when nobody runs `mirror stop`
 
@@ -382,8 +379,7 @@ async function followTargets(rec, client, root) {
   });
   await root.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true })
     .catch((err) => recLog(rec, `setAutoAttach: ${messageOf(err)}`));
-  // Shared and service workers are not auto-attached from a page session (verified: the page's
-  // setAutoAttach never reports them). The browser session discovers them and attaches with flatten.
+  // Shared and service workers are not auto-attached from a page session; the browser session discovers them.
   // note: attachToTarget cannot pause the target, so requests a shared worker starts before this runs can be missed.
   const browserCdp = await client.browser.target().createCDPSession();
   browserCdp.on('Target.targetCreated', async (e) => {
@@ -401,9 +397,8 @@ async function followTargets(rec, client, root) {
 }
 
 /**
- * Document bodies of out-of-process iframes never reach loadingFinished on any session we hold, and
- * Page.getResourceContent does not keep them ("Resource was not cached"). Fetch paused at response time
- * returns the raw body (verified: Wikipedia iframe, 345 KB). Only Documents are paused.
+ * Document bodies of out-of-process iframes never reach loadingFinished, and Page.getResourceContent does not
+ * keep them. Fetch paused at response time returns the raw body, so only Documents are paused.
  * @param {Recorder} rec
  * @param {CDPSession} root
  */
@@ -547,9 +542,7 @@ async function finalize(client, runDir, requestedUrl, navigationError) {
 }
 
 /**
- * Unpacks each saved JS file with webcrack, then runs scout's indexer over the result.
- * The unpack folder is `git init`-ed only so scout can read it; it is scratch, not a repository.
- * scout cannot resolve webpack module ids as imports.
+ * Unpacks each saved JS file with webcrack into `<stampDir>/unpacked`, one output file per input file.
  * @param {string} stampDir
  */
 async function indexSite(stampDir) {
@@ -576,14 +569,7 @@ async function indexSite(stampDir) {
   }));
   for (const o of outcomes) if (o) errors.push(o);
 
-  // A fixed install path, not a PATH lookup: PATH can contain writable directories.
-  const gitExe = [String.raw`C:\Program Files\Git\cmd\git.exe`, String.raw`C:\Program Files (x86)\Git\cmd\git.exe`].find((p) => fs.existsSync(p));
-  if (gitExe) execFileSync(gitExe, ['init', '-q'], { cwd: unpacked });
-  else console.log('git not found at its standard install path; skipped git init in the unpacked folder');
-  const scoutOut = path.join(stampDir, 'scout');
-  execFileSync(process.execPath, [SCOUT_PRECISE, unpacked, scoutOut, '--symbols'], { stdio: 'inherit' });
-
-  return { unpacked, scoutOut, jsFiles: jsFiles.length, errors };
+  return { unpacked, jsFiles: jsFiles.length, errors };
 }
 
 module.exports = { recordSite, createRun, activeRun, indexSite };

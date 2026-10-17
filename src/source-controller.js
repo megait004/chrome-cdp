@@ -112,19 +112,62 @@ class SourceController extends EventEmitter {
   }
 
   /**
+   * A window of one script's source around a line and column, with `>>>` marking the column.
+   * A minified file puts a whole module on one line, so reading a position there means reading a window.
+   * @param {string} scriptIdOrUrl
+   * @param {number} lineNumber 0-based line, counted as the script's own (document line for inline blocks)
+   * @param {number} [columnNumber]
+   * @param {number} [before] characters of context kept before the column
+   * @param {number} [after] characters kept after it
+   */
+  async readAround(scriptIdOrUrl, lineNumber, columnNumber = 0, before = 200, after = 300) {
+    const { source, url, scriptId } = await this.getScriptSource(scriptIdOrUrl);
+    const lines = source.split('\n');
+    const line = lines[lineNumber];
+    if (line === undefined) {
+      throw new Error(`Script ${scriptId} has ${lines.length} line(s): line ${lineNumber} does not exist.`);
+    }
+    const from = Math.max(0, columnNumber - before);
+    return {
+      scriptId,
+      url,
+      lineNumber,
+      column: columnNumber,
+      lineLength: line.length,
+      totalLines: lines.length,
+      text: `${line.slice(from, columnNumber)}>>>${line.slice(columnNumber, columnNumber + after)}`,
+    };
+  }
+
+  /**
    * Lines where a function is defined in one script: `function NAME(` or `NAME = function`.
    * A match is text, not a parse: a string or a comment with the same shape also matches.
    * @param {string} scriptIdOrUrl
    * @param {string} name
-   * @returns {Promise<Array<{ lineNumber: number, lineContent: string }>>}
+   * @returns {Promise<Array<{ lineNumber: number, column: number, lineContent: string }>>}
    */
   async findFunction(scriptIdOrUrl, name) {
     if (!name) throw new TypeError('Function name must not be empty');
     const scriptId = this._resolveScriptId(scriptIdOrUrl);
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const query = `(?<![\\w$])(function\\s+${escaped}\\s*\\(|${escaped}\\s*=\\s*function\\b)`;
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+    const query = String.raw`(?<![\w$])(function\s+${escaped}\s*\(|${escaped}\s*=\s*function\b)`;
     const response = await this._cdp.send('Debugger.searchInContent', { scriptId, query, caseSensitive: true, isRegex: true });
-    return (response.result ?? []).map((m) => ({ lineNumber: m.lineNumber, lineContent: m.lineContent }));
+    // searchInContent returns no column, and a minified line is the whole module, so derive the offset from the
+    // line text: the definition reads `function NAME` or `NAME = function`. Report the start of the declaration,
+    // so `async function NAME` reports the `async` rather than the `function` (a hand measurement sees the same).
+    /** @param {string} lineContent */
+    const columnOf = (lineContent) => {
+      const at = [`function ${name}`, `${name} = function`, `${name}=function`]
+        .map((needle) => lineContent.indexOf(needle))
+        .filter((index) => index >= 0);
+      const start = at.length ? Math.min(...at) : lineContent.indexOf(name);
+      return lineContent.slice(Math.max(0, start - 6), start) === 'async ' ? start - 6 : start;
+    };
+    return (response.result ?? []).map((m) => ({
+      lineNumber: m.lineNumber,
+      column: columnOf(m.lineContent),
+      lineContent: m.lineContent,
+    }));
   }
 
   /**
@@ -137,6 +180,12 @@ class SourceController extends EventEmitter {
       return scriptIdOrUrl;
     }
 
+    // A bare number is a scriptId, so it must not fall through to URL matching: "13" would otherwise match every
+    // URL containing 13. Ids are only valid for the page that produced them.
+    if (/^\d+$/.test(scriptIdOrUrl)) {
+      throw new Error(`Script ${scriptIdOrUrl} is not in this page (scriptIds change on navigation, so list them again with: node cli.js vm-scripts). Known ids: ${Array.from(this._scripts.keys()).slice(0, 20).join(', ')}`);
+    }
+
     // URLs are stored percent-encoded (a space is %20), so compare decoded forms too.
     // Several hits is an error, not a silent first match: the first one may be an inline script.
     const want = safeDecode(scriptIdOrUrl);
@@ -145,11 +194,8 @@ class SourceController extends EventEmitter {
     if (hits.length > 1) {
       const exact = hits.filter(([, s]) => safeDecode(s.url) === want);
       if (exact.length === 1) return exact[0][0];
-      throw new Error(`"${scriptIdOrUrl}" matches ${hits.length} scripts. Pass the scriptId instead: ${hits.map(([id, s]) => `${id} ${s.url || '(inline)'}`).join(' | ')}`);
-    }
-
-    if (/^\d+$/.test(scriptIdOrUrl)) {
-      return scriptIdOrUrl;
+      const listing = hits.map(([id, s]) => `${id} ${s.url || '(inline)'}`).join(' | ');
+      throw new Error(`"${scriptIdOrUrl}" matches ${hits.length} scripts. Pass the scriptId instead: ${listing}`);
     }
 
     throw new Error(`Script not found for identifier: ${scriptIdOrUrl}`);

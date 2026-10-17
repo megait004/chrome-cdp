@@ -5,7 +5,7 @@
 // breakpoint cannot name it. Chrome's instrumentation breakpoint reaches every script (V8 attaches it per
 // script as it is parsed), and a breakpoint by scriptId reaches inside the payload.
 //
-// What the two pauses can and cannot do (verified live, see references/api.md):
+// What the two pauses can and cannot do (see references/api.md):
 //   - Instrumentation pause: reading script sources and frame positions works; evaluating in a call frame
 //     times out, because the renderer's JS thread does not service those requests at this pause.
 //   - Breakpoint pause inside a script: evaluating and reading scopes works.
@@ -86,6 +86,80 @@ async function resumeIfPaused(client) {
   }
 }
 
+/**
+ * The stack of a pause, with URLs resolved through scriptIds (CallFrame.url is deprecated).
+ * @param {Client} client
+ * @param {import('devtools-protocol').Protocol.Debugger.PausedEvent} event
+ */
+function describeFrames(client, event) {
+  const urls = new Map(client.sources.getScripts().map((s) => [s.scriptId, s.url]));
+  return (event.callFrames ?? []).slice(0, 10).map((f) => ({
+    functionName: f.functionName || '(anonymous)',
+    scriptId: f.location?.scriptId ?? '',
+    url: (f.location?.scriptId && urls.get(f.location.scriptId)) || '',
+    lineNumber: f.location?.lineNumber ?? -1,
+    columnNumber: f.location?.columnNumber ?? -1,
+  }));
+}
+
+/**
+ * Reports the script about to run, or null when this pause is not the wanted one.
+ * @param {Client} client
+ * @param {import('devtools-protocol').Protocol.Debugger.PausedEvent} event
+ * @param {{ minBytes: number | null, maxBytes: number | null, onlyRuntime: boolean }} options
+ * @returns {Promise<CatchReport | null>}
+ */
+async function describeCandidate(client, event, options) {
+  const frames = event.callFrames ?? [];
+  // The breakpoint's aux data names the script about to run; frame 0 is inside it.
+  const scriptId = /** @type {string} */ (event.data?.scriptId ?? frames[0]?.location?.scriptId ?? '');
+  const url = /** @type {string} */ (event.data?.url ?? '');
+
+  // An inline <script> block carries the document URL; the payload this command hunts for has none.
+  if (options.onlyRuntime && url !== '') return null;
+
+  // Chrome reports each script's length as it parses, so a size filter can reject a candidate without
+  // transferring its source — the payload this command is aimed at can be megabytes.
+  const knownLength = client.sources.getScripts().find((s) => s.scriptId === scriptId)?.length ?? null;
+  const outOfRange = (/** @type {number} */ length) =>
+    (options.minBytes !== null && length < options.minBytes) || (options.maxBytes !== null && length > options.maxBytes);
+  if (knownLength !== null && outOfRange(knownLength)) return null;
+
+  let length = null;
+  let source = '';
+  let sourceError = null;
+  try {
+    ({ source } = await client.sources.getScriptSource(scriptId));
+    length = source.length;
+  } catch (err) {
+    // WebAssembly has no JavaScript source, and a cleared context loses it: say so instead of guessing a size.
+    sourceError = messageOf(err);
+    console.error(`source unavailable for script ${scriptId}: ${sourceError}`);
+  }
+  // With a size filter and no size, the candidate cannot be confirmed: skip it rather than report the wrong one.
+  if (length === null && (options.minBytes !== null || options.maxBytes !== null)) return null;
+  if (length !== null && outOfRange(length)) return null;
+
+  const caller = frames[1];
+  let callerExcerpt = null;
+  if (caller?.location?.scriptId) {
+    try {
+      // A frame's line number counts from the top of the DOCUMENT for an inline script (startLine > 0) and
+      // from the script itself otherwise; readAround wants the script's own line.
+      const callerStart = client.sources.getScripts().find((s) => s.scriptId === caller.location.scriptId)?.startLine ?? 0;
+      const callerLine = Math.max(0, (caller.location.lineNumber ?? 0) - callerStart);
+      const callerWindow = await client.sources.readAround(caller.location.scriptId, callerLine, caller.location.columnNumber ?? 0);
+      callerExcerpt = callerWindow.text;
+    } catch { /* the caller may be a script we cannot read; the frames still name it */ }
+  }
+  return {
+    reason: event.reason ?? '',
+    script: { scriptId, url, length, head: source.slice(0, 120).replace(/\s+/g, ' ') },
+    frames: describeFrames(client, event),
+    callerExcerpt,
+  };
+}
+
 /** @param {RevealDeps} deps */
 function createRevealCommands({ attach, emit, release, isHttpUrl }) {
   /** @param {string[]} args @param {string} name */
@@ -94,84 +168,15 @@ function createRevealCommands({ attach, emit, release, isHttpUrl }) {
     return index > 0 ? args[index + 1] : null;
   };
 
-  /**
-   * The stack of a pause, with URLs resolved through scriptIds (CallFrame.url is deprecated).
-   * @param {Client} client
-   * @param {import('devtools-protocol').Protocol.Debugger.PausedEvent} event
-   */
-  function describeFrames(client, event) {
-    const urls = new Map(client.sources.getScripts().map((s) => [s.scriptId, s.url]));
-    return (event.callFrames ?? []).slice(0, 10).map((f) => ({
-      functionName: f.functionName || '(anonymous)',
-      scriptId: f.location?.scriptId ?? '',
-      url: (f.location?.scriptId && urls.get(f.location.scriptId)) || '',
-      lineNumber: f.location?.lineNumber ?? -1,
-      columnNumber: f.location?.columnNumber ?? -1,
-    }));
-  }
-
-  /**
-   * Text around a position in a minified file, where the whole file is often one line.
-   * @param {string} source
-   * @param {number} lineNumber
-   * @param {number} columnNumber
-   */
-  function excerptAround(source, lineNumber, columnNumber) {
-    const line = source.split('\n')[lineNumber] ?? '';
-    const from = Math.max(0, columnNumber - 200);
-    return `${line.slice(from, columnNumber)}>>>${line.slice(columnNumber, columnNumber + 300)}`;
-  }
-
-  /**
-   * Reports the script about to run, or null when this pause is not the wanted one.
-   * @param {Client} client
-   * @param {import('devtools-protocol').Protocol.Debugger.PausedEvent} event
-   * @param {{ minBytes: number | null }} options
-   * @returns {Promise<CatchReport | null>}
-   */
-  async function describeCandidate(client, event, options) {
-    const frames = event.callFrames ?? [];
-    // The breakpoint's aux data names the script about to run; frame 0 is inside it.
-    const scriptId = /** @type {string} */ (event.data?.scriptId ?? frames[0]?.location?.scriptId ?? '');
-    const url = /** @type {string} */ (event.data?.url ?? '');
-
-    // Chrome reports each script's length as it parses, so a size filter can reject a candidate without
-    // transferring its source — the payload this command is aimed at can be megabytes.
-    const knownLength = client.sources.getScripts().find((s) => s.scriptId === scriptId)?.length ?? null;
-    if (options.minBytes !== null && knownLength !== null && knownLength < options.minBytes) return null;
-
-    let length = null;
-    let source = '';
-    try {
-      ({ source } = await client.sources.getScriptSource(scriptId));
-      length = source.length;
-    } catch (err) {
-      // WebAssembly scripts have no JavaScript source; report the failure instead of a wrong size.
-      console.error(`source unavailable for script ${scriptId}: ${messageOf(err)}`);
-    }
-    if (options.minBytes !== null && (length === null || length < options.minBytes)) return null;
-
-    const caller = frames[1];
-    let callerExcerpt = null;
-    if (caller?.location?.scriptId) {
-      try {
-        const { source: callerSource } = await client.sources.getScriptSource(caller.location.scriptId);
-        callerExcerpt = excerptAround(callerSource, caller.location.lineNumber ?? 0, caller.location.columnNumber ?? 0);
-      } catch { /* the caller may be a script we cannot read; the frames still name it */ }
-    }
-    return {
-      reason: event.reason ?? '',
-      script: { scriptId, url, length, head: source.slice(0, 120).replace(/\s+/g, ' ') },
-      frames: describeFrames(client, event),
-      callerExcerpt,
-    };
-  }
 
   /** @param {Ctx} ctx */
   async function cmdCatchScript({ args, port, outFile }) {
     const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
     const minBytesArg = flag(args, '--min-bytes');
     const minBytes = minBytesArg === null ? null : Number(minBytesArg);
+    const maxBytesArg = flag(args, '--max-bytes');
+    const maxBytes = maxBytesArg === null ? null : Number(maxBytesArg);
+    const onlyRuntime = args.includes('--only-runtime');
     const breakLineArg = flag(args, '--break-line');
     const breakLine = breakLineArg === null ? null : Number(breakLineArg);
     const breakColArg = flag(args, '--break-col');
@@ -181,6 +186,8 @@ function createRevealCommands({ attach, emit, release, isHttpUrl }) {
     const evalFrameIndex = frameArg === null ? 0 : Number(frameArg);
     const timeoutSec = Number(flag(args, '--timeout') ?? 30);
     if (minBytes !== null && (!Number.isFinite(minBytes) || minBytes < 0)) throw new Error('--min-bytes expects a number of characters, e.g. --min-bytes 200000');
+    if (maxBytes !== null && (!Number.isFinite(maxBytes) || maxBytes <= 0)) throw new Error('--max-bytes expects a number of characters, e.g. --max-bytes 1000000');
+    if (minBytes !== null && maxBytes !== null && minBytes > maxBytes) throw new Error(`--min-bytes ${minBytes} is above --max-bytes ${maxBytes}: no script can match`);
     if (breakLine !== null && (!Number.isInteger(breakLine) || breakLine < 0)) throw new Error('--break-line expects a 0-based line inside the caught script');
     if (!Number.isFinite(breakCol) || breakCol < 0) throw new Error('--break-col expects a 0-based column');
     if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error('--timeout expects seconds, e.g. --timeout 30');
@@ -189,6 +196,7 @@ function createRevealCommands({ attach, emit, release, isHttpUrl }) {
     const client = await attach(port);
     // Subscribe before arming: a pause that arrives while the command works must not be lost.
     const pauses = pauseQueue(client);
+    const options = { minBytes, maxBytes, onlyRuntime };
     /** @type {string | null} */
     let armed = null;
     try {
@@ -211,7 +219,7 @@ function createRevealCommands({ attach, emit, release, isHttpUrl }) {
         const event = await pauses.next((deadline - Date.now()) / 1000);
         if (!event) break;
         scriptsSeen += 1;
-        report = await describeCandidate(client, event, { minBytes });
+        report = await describeCandidate(client, event, options);
         if (!report) {
           if (!(await resumeIfPaused(client))) expired += 1;
         }
@@ -224,9 +232,26 @@ function createRevealCommands({ attach, emit, release, isHttpUrl }) {
       const result = { ...report, scriptsSeen };
 
       if (breakLine !== null) {
-        // Stop inside the payload: only a breakpoint by scriptId can name a script with no URL.
-        const bp = await client.debug.setBreakpointAtLocation(report.script.scriptId, breakLine, breakCol);
-        result.breakpoint = { line: breakLine, column: breakCol, actual: bp.actualLocation };
+        // Debugger locations count from the top of the DOCUMENT when the script starts on a later document line
+        // (an inline <script> block), and from the script otherwise. Line 0 of such a script does not resolve.
+        const info = client.sources.getScripts().find((s) => s.scriptId === report.script.scriptId);
+        if (info && (breakLine < info.startLine || breakLine > info.endLine)) {
+          const range = info.startLine === 0
+            ? `0..${info.endLine} (relative to the script)`
+            : `${info.startLine}..${info.endLine} (lines of the document: this script starts on line ${info.startLine})`;
+          throw new Error(`Script ${report.script.scriptId} has no line ${breakLine}: use ${range}.`);
+        }
+        // Columns are document-relative too for an inline script, whose code starts after its <script> tag:
+        // default to where the script's code begins, so a line alone is enough.
+        const column = breakColArg === null ? (info?.startColumn ?? 0) : breakCol;
+        let bp;
+        try {
+          bp = await client.debug.setBreakpointAtLocation(report.script.scriptId, breakLine, column);
+        } catch (err) {
+          // Chrome's own "Could not resolve breakpoint" says nothing about why; the script's start column does.
+          throw new Error(`Chrome could not resolve ${report.script.scriptId}:${breakLine}:${column}: ${messageOf(err)}. This script is at line ${info?.startLine ?? 0}, column ${info?.startColumn ?? 0}; pick a line:column that contains code.`);
+        }
+        result.breakpoint = { line: breakLine, column, actual: bp.actualLocation };
         if (armed) { await client.debug.removeBreakpoint(armed).catch(() => {}); armed = null; }
         await resumeIfPaused(client);
 

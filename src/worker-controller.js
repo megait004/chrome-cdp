@@ -37,9 +37,7 @@ class WorkerController extends EventEmitter {
 
   /** @param {import('puppeteer-core').Target} target */
   _getWorkerType(target) {
-    // note: raw CDP type first ON PURPOSE — puppeteer reports dedicated workers
-    // as 'other' (public target.type() loses the info), while the CDP targetInfo
-    // carries the real 'worker' type. Verified manually against a live Chrome: a dedicated worker is reported as 'other' by Puppeteer.
+    // Raw CDP type first: Puppeteer reports dedicated workers as 'other', while the CDP targetInfo carries 'worker'.
     // _getTargetInfo is a puppeteer internal, not in its public types; guarded by the typeof check
     const internal = /** @type {{ _getTargetInfo?: () => { type?: string } | undefined }} */ (/** @type {unknown} */ (target));
     const raw = typeof internal._getTargetInfo === 'function' ? internal._getTargetInfo()?.type : null;

@@ -55,6 +55,18 @@ function decodePostData(entries) {
   return entries.map((entry) => (entry.bytes ? Buffer.from(entry.bytes, 'base64').toString('utf8') : '')).join('');
 }
 
+/**
+ * The HTTP version line for raw text, from CDP's protocol string ('http/1.1', 'h2', 'h3', 'quic').
+ * @param {string | null | undefined} protocol
+ * @returns {string}
+ */
+function httpVersionOf(protocol) {
+  const p = (protocol || '').toLowerCase();
+  if (p === 'h3' || p.includes('quic')) return 'HTTP/3';
+  if (p === 'h2' || p.includes('http/2')) return 'HTTP/2';
+  return 'HTTP/1.1';
+}
+
 class NetworkController extends EventEmitter {
   /**
    * @param {import('puppeteer-core').Page} page
@@ -263,17 +275,17 @@ class NetworkController extends EventEmitter {
     const parsedUrl = new URL(entry.url);
     const pathAndQuery = `${parsedUrl.pathname}${parsedUrl.search}`;
     const method = entry.method || 'GET';
-    const httpVersion = entry.protocol?.toUpperCase().includes('HTTP/2') ? 'HTTP/2' : 'HTTP/1.1';
+    const httpVersion = httpVersionOf(entry.protocol);
 
     const lines = [`${method} ${pathAndQuery} ${httpVersion}`];
 
     const headers = entry.rawHeaders || entry.headers || {};
-    if (!headers['host'] && !headers['Host']) {
+    // HTTP/2 carries :authority instead of Host, and adding Host back would be wrong on the wire.
+    if (!headers['host'] && !headers['Host'] && !headers[':authority']) {
       lines.push(`Host: ${parsedUrl.host}`);
     }
 
     for (const [k, v] of Object.entries(headers)) {
-      if (k.startsWith(':')) continue; // Skip HTTP/2 pseudo-headers in raw text
       lines.push(`${k}: ${v}`);
     }
 
@@ -299,11 +311,10 @@ class NetworkController extends EventEmitter {
     if (entry.rawResponseHeadersText) {
       lines.push(entry.rawResponseHeadersText.trim());
     } else {
-      const httpVersion = entry.protocol?.toUpperCase().includes('HTTP/2') ? 'HTTP/2' : 'HTTP/1.1';
+      const httpVersion = httpVersionOf(entry.protocol);
       lines.push(`${httpVersion} ${entry.status || 200} ${entry.statusText || 'OK'}`);
       const headers = entry.rawResponseHeaders || entry.responseHeaders || {};
       for (const [k, v] of Object.entries(headers)) {
-        if (k.startsWith(':')) continue;
         lines.push(`${k}: ${v}`);
       }
     }
@@ -368,7 +379,10 @@ class NetworkController extends EventEmitter {
       ? !re[2].includes('i')          // /.../flags string: case-sensitive unless the i flag
       : query instanceof RegExp ? !query.ignoreCase // RegExp instance: its own flag
       : false;                        // plain string: substring search is case-insensitive
-    const localRegex = new RegExp(searchQuery, caseSensitive ? '' : 'i');
+    // A plain string is a substring, not a pattern: escape it for the local fallback (Chrome's own
+    // searchInResponseBody already treats a non-regex query literally).
+    const localSource = isRegex ? searchQuery : searchQuery.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+    const localRegex = new RegExp(localSource, caseSensitive ? '' : 'i');
 
     const single = options.requestId ? this._entries.get(options.requestId) : undefined;
     const targets = options.requestId ? (single ? [single] : []) : Array.from(this._entries.values());

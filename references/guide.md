@@ -30,6 +30,11 @@ node cli.js eval "({href: location.href, links: document.links.length})"
 
 Write a script only for control flow the CLI cannot express: waits on a WebSocket frame while sending, breakpoints with `evaluateOnCallFrame`, or bulk processing of a large capture. Then `require('../index')` from a file in `.tmp/`, and `disconnect()` in a `finally`.
 
+Two mistakes that cost time on every investigation of the skill itself:
+
+- **`require` counts directory levels.** A script at `.tmp/x.js` needs `require('../index')`; one in a subdirectory, `.tmp/gecko/x.js`, needs `require('../../index')`. Getting it wrong is a `MODULE_NOT_FOUND` that reads like the skill is broken.
+- **PowerShell does not expand globs for a native command.** `rg -n "pattern" src/*.js` fails with `The filename, directory name, or volume label syntax is incorrect`; that is the shell, not ripgrep. Use `rg -n "pattern" -g "*.js" .`, or `rg -n "pattern" src` (ripgrep recurses), or `fd -e js . src`.
+
 Before you open the page, list every question you want answered. One session answers them all. Each extra navigation re-records traffic and invalidates the `scriptId`s you hold.
 
 ## Interaction loop
@@ -82,7 +87,7 @@ await assertEventually(() => client.websocket.getSockets({ state: 'open' }), {
 
 ## Response bodies
 
-Request metadata lives in the library's memory and survives the session. Response bodies live in Chrome's buffer. Chrome evicts them under pressure and clears them on navigation. `startRecording()` configures durable storage (100 MB total, 5 MB per resource), so bodies normally survive navigation. This was checked against the Chromium source, not by a live test.
+Request metadata lives in the library's memory and survives the session. Response bodies live in Chrome's buffer. Chrome evicts them under pressure and clears them on navigation. `startRecording()` configures durable storage (100 MB total, 5 MB per resource), so bodies normally survive navigation.
 
 - Durable storage is bounded: the oldest bodies go first in a long session.
 - On an older Chrome build the call is ignored. An empty body there means "not stored", not "empty response". Say so in the report.
@@ -118,7 +123,13 @@ Structure the answer so a reader can verify it without rerunning anything:
 
 ## Render pipeline
 
-Checked against Chromium's source (`references/chromium`, Blink `core/`). Paths are relative to `third_party/blink/renderer/core/`.
+Source: Chromium's Blink `core/` (`third_party/blink/renderer/core/` in the chromium/chromium repository). That tree is not part of this skill. To read it, clone sparsely (the repository is large):
+
+```bash
+git clone --filter=blob:none --no-checkout --depth 1 https://github.com/chromium/chromium.git references/chromium
+git -C references/chromium sparse-checkout set third_party/blink/renderer/core/<dir> third_party/blink/renderer/core/<dir2>
+git -C references/chromium checkout
+```
 
 - **Order per frame:** style, layout, compositing inputs, pre-paint, paint (`dom/document_lifecycle.h`, `frame/local_frame_view.cc` `UpdateLifecyclePhasesInternal`). Layout can run again inside the same frame when a step after layout dirties it again (the loop in that function).
 - **Reading layout forces it.** `offsetWidth` and the other geometry getters call `UpdateStyleAndLayoutForNode` synchronously (`dom/element.cc`, `OffsetWidth`). A write followed by a read in one task costs a full style and layout each time.
@@ -157,13 +168,33 @@ live work is the middle.
 2. `node cli.js catch-script <url> --min-bytes 2000000` pauses **before** that payload runs and prints the stack.
    Frame 0 is the payload; frame 1 is the function that built it; `callerExcerpt` is the code at the call site —
    the `new Function(...)` (or equivalent) call with its arguments. That is the decode entry, live.
+
+   Size alone may not be enough to name the target: a page can also have a large *inline* block that runs first, and
+   that block wins `--min-bytes`. Narrow with `--only-runtime` (scripts with no URL) and `--max-bytes`. A common
+   shape is a decoder module shipped as one huge string inside the HTML, which then builds the payload in memory:
+   the module is a runtime script of a few hundred kilobytes to a few megabytes, while the inline block is excluded
+   by `--only-runtime`. Passing a `--break-line` outside the script's range is rejected with that range.
+
+   Two traps around the bounds and the position arguments:
+   - The size bounds count **UTF-16 code units**, not bytes. `getScriptSource().length`, the `length` in
+     `vm-scripts` and the bounds all use the same unit, so a window never mis-targets a script; but comparing that
+     window against a file written by `download-bundle` does not hold, because the file is UTF-8 and its size grows
+     with every non-ASCII identifier in the script.
+   - A position's **line is the document's** for an inline `<script>` block and the script's own otherwise. A 1-line
+     inline block at document line N resolves at `--break-line N` (with `--break-col` left to default to the
+     script's start column), and `--break-line 0` fails with "Could not resolve breakpoint". Runtime scripts, the
+     usual target, start at line 0 and are unaffected.
 3. Same call with `--break-line 0`: the command then breaks inside the payload and prints `locals` (the payload's own
    frame), `callerLocals` (the decoder's variables — the tables and native constructors it was handed) and
    `evaluated` for `--eval <expr>`. Add `--frame 1` to evaluate in the decoder's frame instead of the payload's.
+   `find-function <id> <name>` gives a function's line **and column**, and `snippet <id> <line> --col N` prints the
+   characters around that position (`>>>` marks the column). A minified script is one line of a million characters, so
+   a window is the only way to read a position: those two commands replace the off-by-hand helper scripts otherwise
+   needed to hunt an offset.
 4. For a later hang or branch, `node cli.js break <scriptId> <line> --col N --trigger "<js>" --eval <expr>` breaks
    inside the same payload again, at a line you chose.
 
-Two traps, both hit on a real payload:
+Two traps:
 
 - **The pause before a script runs cannot read values.** At an instrumentation pause, `evaluateOnCallFrame`,
   `Runtime.getProperties` and `Runtime.evaluate` time out — the renderer's JS thread does not answer them — while
@@ -177,6 +208,19 @@ Primitives behind it, for scripts of your own: `client.debug.setInstrumentationB
 `setBreakpointAtLocation(scriptId, line, column, condition)`, `getScopeValues(callFrame, { limit })`,
 `evaluateOnCallFrame(callFrameId, expression)`. The pause state lives and dies with one CDP session, so a multi-step
 walk has to run inside a single script under `.tmp/`.
+
+One trap from doing that: with the breakpoint armed, `await client.cdp.send('Page.navigate', ...)` can time out, because
+the paused renderer holds the response back. Fire the navigation without awaiting it and let the pause loop drive.
+`catch-script` avoids this: it arms first, then sends `Page.navigate` and reads only its reply for the error text,
+never waiting for a load event.
+
+When `catch-script` cannot name the script you want — its size filter has no way to single it out, or you need a
+breakpoint armed *before* a particular module is created — write one `.tmp/` script that does the whole walk in a
+single session: `debug.enable()`, `sources.enable()`, `setInstrumentationBreakpoint('beforeScriptExecution')`,
+resume-through-pauses until your predicate matches, then `setBreakpointAtLocation(scriptId, line, column)`,
+`resume()`, wait for the hit, and read `getScopeValues` / `evaluateOnCallFrame`. That path is why the primitives are
+public: a breakpoint is only valid while the session that armed it is alive, and arming after the decode already ran
+will never hit (`break 1846 2 --col 847987` reported `hit: false` for exactly that reason).
 
 ## Command details
 

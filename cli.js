@@ -7,7 +7,7 @@ const { connect, startChrome, waitUntil, checkCdpReady, DebugController } = requ
 const T = require('./src/timeouts');
 const { spawn } = require('node:child_process');
 const { recordSite, createRun, activeRun, indexSite } = require('./src/site-mirror');
-const { messageOf } = require('./src/util');
+const { messageOf, settleWithin } = require('./src/util');
 
 let tabIndex = 0; // set from --tab; every command attaches to this tab
 
@@ -92,16 +92,23 @@ Commands:
                                 scriptId, start line, line count, and the first 100 characters
   find-function [url] <queryOrId> <name>
                                 Lines where a function is defined ("function NAME(" or "NAME = function"),
-                                each cut to 300 characters
+                                with the column of the definition; each line cut to 300 characters
+  snippet [url] <queryOrId> <line> [--col N] [--before N] [--after N]
+                                Read a window of a script's source around a position, marking the column
+                                with >>>. Use it after find-function or catch-script: a minified script is one
+                                huge line, so a position in it can only be read as a window
   layout [url] [--wait S]       Record style, layout, pre-paint and paint for S seconds (default 5; interact
                                 meanwhile) and report totals and the script location that caused each stage
   events [url]                  Every event listener registered on the window and the document tree
                                 (and iframes), grouped by event type and handler location
-  catch-script [url] [--min-bytes N] [--break-line N] [--break-col N] [--eval <expr>] [--frame N] [--timeout S]
+  catch-script [url] [--min-bytes N] [--max-bytes N] [--only-runtime] [--break-line N] [--break-col N]
+                                [--eval <expr>] [--frame N] [--timeout S]
                                 Pause before a script runs, report the script and the stack, then (with
                                 --break-line) stop inside that script, list the variables of the frame and of
                                 its caller, and run --eval (--frame picks the frame, default 0). Reaches code
-                                with no URL that the break command cannot name. --min-bytes skips small scripts
+                                with no URL that the break command cannot name. Narrows the target with
+                                --min-bytes/--max-bytes (script characters) and --only-runtime (scripts with
+                                no URL, which skips inline HTML blocks)
   profile [url] [--wait S]      CPU profile for S seconds (default 5; interact meanwhile): functions by
                                 self time, with the two callers that called them most
   mirror start <url> [outDir]   Load the URL with the cache off and start recording in the
@@ -111,8 +118,8 @@ Commands:
                                 Writes outDir/<host>/<timestamp>/ (default .tmp/mirror)
   mirror stop [outDir]          Stop the active recording; writes cookies.json, storage.json,
                                 rendered.html and manifest.json. LATEST names the newest run
-  index-site <stampDir>         Unpack every JS file of a mirror run with webcrack, then run
-                                scout's precise.mjs on the result (symbols, dead code, refs)
+  index-site <stampDir>         Unpack every JS file of a mirror run with webcrack
+                                into <stampDir>/unpacked
   traffic [url] [--bodies] [--wait S] [--headers]
                                 Record network + WebSocket frames. With a URL: navigate,
                                 wait for network idle, then for the first WS frame.
@@ -183,8 +190,8 @@ Options:
 `;
 
 /**
- * Splits global options out of argv so they never land in a positional slot --
- * `eval <expr> --port 9333` used to evaluate the flags as part of the expression.
+ * Splits global options out of argv so they never land in a positional slot, so `eval <expr> --port 9333`
+ * evaluates only the expression.
  * @param {string[]} argv
  * @returns {{ positional: string[], port: number, isJson: boolean, out: string|null, tab: number }}
  */
@@ -351,7 +358,7 @@ const bundles = createBundleCommands({
   isHttpUrl,
   T,
 });
-const { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch, cmdVmScripts, cmdFindFunction } = bundles;
+const { cmdSearchSources, cmdDownloadBundle, cmdDeobfuscate, cmdUnpack, cmdAstSearch, cmdVmScripts, cmdFindFunction, cmdSnippet } = bundles;
 
 const { createLayoutCommands } = require('./src/commands/layout');
 const { cmdLayout } = createLayoutCommands({
@@ -455,7 +462,6 @@ async function cmdIndexSite({ args }) {
   if (!args[1]) throw new Error('Usage: node cli.js index-site <stampDir>  (a run folder written by mirror)');
   const r = await indexSite(path.resolve(args[1]));
   console.log(`Unpacked ${r.jsFiles - r.errors.length}/${r.jsFiles} JS files -> ${r.unpacked}`);
-  console.log(`Scout index -> ${r.scoutOut}`);
   for (const e of r.errors) console.log(`  unpack failed: ${e.file}: ${e.error}`);
 }
 
@@ -641,6 +647,11 @@ async function setScriptBreakpoint(client, scriptQuery, line, col, condition) {
   // A bare number is a scriptId: the only way to break inside a script with no URL (eval, Function, a
   // decoded payload). URL matching cannot name such a script.
   if (/^\d+$/.test(scriptQuery)) {
+    // A numeric query is a scriptId, and an id from the previous page is a mistake worth naming: the ids are only
+    // valid for the load that produced them.
+    if (!client.sources.getScripts().some((s) => s.scriptId === scriptQuery)) {
+      throw new Error(`Script ${scriptQuery} is not in this page (scriptIds change on navigation: list them again with: node cli.js vm-scripts).`);
+    }
     const result = await client.debug.setBreakpointAtLocation(scriptQuery, line, col, condition || undefined);
     return { bp: { breakpointId: result.breakpointId, locations: [result.actualLocation] }, targetUrl: `scriptId ${scriptQuery}`, matchedScripts: 1 };
   }
@@ -821,16 +832,35 @@ function takeFlag(args, name) {
 }
 
 /** @param {Ctx} ctx */
-async function cmdTabs({ port }) {
+async function cmdTabs({ port, outFile }) {
   const client = (activeClient = await attach(port));
-  const pages = await client.browser.pages();
-  const rows = await Promise.all(pages.map(async (page, index) => ({ tab: index, url: page.url(), title: await page.title().catch(() => ''), active: index === tabIndex })));
-  await emit(rows, null);
+  // Target info comes without touching a renderer; only the title and the visibility need the page, and
+  // that is bounded so one blocked tab cannot hang the listing.
+  const targets = client.browser.browserContexts().flatMap((context) => context.targets()).filter((target) => target.type() === 'page');
+  const rows = await Promise.all(targets.map(async (target, index) => {
+    const info = await settleWithin(describeTab(target), T.UNRESPONSIVE_WAIT_MS, `reading tab ${index}`);
+    return { tab: index, url: target.url(), title: info?.title ?? '', active: info?.visible ?? null };
+  }));
+  await emit(rows, outFile);
   await release(client);
 }
 
+/**
+ * Title and foreground state of one tab. Only the tab the browser is showing reports
+ * `visibilityState === 'visible'`, which is the only accurate read CDP offers (there is no
+ * "selected tab" command; a minimized window reports none as visible).
+ * @param {import('puppeteer-core').Target} target
+ * @returns {Promise<{ title: string, visible: boolean } | null>}
+ */
+async function describeTab(target) {
+  const page = await target.page();
+  if (!page) return null;
+  const [title, visible] = await Promise.all([page.title(), page.evaluate(() => document.visibilityState === 'visible')]);
+  return { title, visible };
+}
+
 /** @param {Ctx} ctx */
-async function cmdFrames({ port }) {
+async function cmdFrames({ port, outFile }) {
   const client = (activeClient = await attach(port));
   const rows = await Promise.all(client.visual.frames().map(async (frame, index) => {
     const scan = await scanFrame(client, frame);
@@ -838,7 +868,7 @@ async function cmdFrames({ port }) {
     // that sizes its view from these numbers reads the same values.
     return { frame: index, canvases: scan.canvases.length, canvasSizes: scan.canvases.map((c) => `${c.width}x${c.height}`), elements: scan.elements.length, url: frame.url().slice(0, 120), error: scan.error };
   }));
-  await emit(rows, null);
+  await emit(rows, outFile);
   await release(client);
 }
 
@@ -847,10 +877,22 @@ async function cmdStatus({ port }) {
   if (await checkCdpReady(port)) {
     console.log(`Chrome: running on port ${port}`);
     // Where the tab is and whether a command holds a pause, so a stalled run can be checked without a new action.
-    const client = (activeClient = await attach(port));
-    console.log(`Tab: ${client.url()} | ${await client.title()}`);
-    console.log(`Frames: ${client.visual.frames().length} | Paused: ${DebugController.readPauseMarker() ? 'yes (node cli.js resume)' : 'no'}`);
-    await release(client);
+    const paused = DebugController.readPauseMarker() ? 'yes (node cli.js resume)' : 'no';
+    const client = await attach(port).catch((error) => {
+      // A blocked renderer answers no page commands at all, so report that instead of failing the health check.
+      if (!(error instanceof Error && error.name === 'UnresponsiveTabError')) throw error;
+      console.log(error.message);
+      console.log(`Paused: ${paused}`);
+      return null;
+    });
+    if (client) {
+      activeClient = client;
+      // Bounded: on a blocked renderer the title never arrives, and status must still report the tab.
+      const title = await settleWithin(client.title(), T.UNRESPONSIVE_WAIT_MS, 'reading the tab title');
+      console.log(`Tab: ${client.url()} | ${title ?? '(no answer: the renderer is blocked)'}`);
+      console.log(`Frames: ${client.visual.frames().length} | Paused: ${paused}`);
+      await release(client);
+    }
   } else {
     console.log(`Chrome: not running on port ${port} (start it with: node cli.js start)`);
   }
@@ -873,7 +915,7 @@ async function cmdClean() {
 }
 
 /** @param {Ctx} ctx */
-async function cmdClickAt({ args, port }) {
+async function cmdClickAt({ args, port, outFile }) {
   const frame = takeFlag(args, '--frame');
   // --button right is needed for games that move the player with the right mouse button.
   const button = takeFlag(args, '--button') ?? 'left';
@@ -899,7 +941,7 @@ async function cmdClickAt({ args, port }) {
     y += off.y;
   }
   await client.visual.click(x, y, { frame: frame ?? undefined, button: /** @type {'left' | 'middle' | 'right'} */ (button) });
-  await emit({ ok: true, action: 'click-at', x: x0, y: y0, button, frame: frame ?? null, canvas: canvasRelative }, null);
+  await emit({ ok: true, action: 'click-at', x: x0, y: y0, button, frame: frame ?? null, canvas: canvasRelative }, outFile);
   await release(client);
 }
 
@@ -915,7 +957,7 @@ async function waitForFrame(client, frame) {
 }
 
 /** @param {Ctx} ctx */
-async function cmdKey({ args, port }) {
+async function cmdKey({ args, port, outFile }) {
   const hold = takeFlag(args, '--hold');
   const code = args[1];
   if (!code) throw new Error('key expects a KeyboardEvent.code: key <KeyW|Space|ArrowLeft> [--hold MS]');
@@ -926,7 +968,7 @@ async function cmdKey({ args, port }) {
   if (!Number.isFinite(holdMs) || holdMs < 0) throw new Error('--hold expects milliseconds, e.g. --hold 300');
   const client = (activeClient = await attach(port));
   await client.visual.key(code, { holdMs });
-  await emit({ ok: true, action: 'key', code, holdMs }, null);
+  await emit({ ok: true, action: 'key', code, holdMs }, outFile);
   await release(client);
 }
 
@@ -990,7 +1032,8 @@ async function cmdCanvas({ args, port, outFile }) {
 
 /** @param {Snapshot} snap */
 function elementKeys(snap) {
-  return snap.elements.map((e) => `${e.tag}|${e.id || ''}|${e.text || ''}`);
+  // The live value belongs to the identity: filling a select or a textarea changes no tag, id or text.
+  return snap.elements.map((e) => `${e.tag}|${e.id || ''}|${e.text || ''}|${e.value || ''}`);
 }
 
 /**
@@ -1269,6 +1312,7 @@ async function main() {
     case 'ast-search': await cmdAstSearch(ctx); break;
     case 'vm-scripts': await cmdVmScripts(ctx); break;
     case 'find-function': await cmdFindFunction(ctx); break;
+    case 'snippet': await cmdSnippet(ctx); break;
     case 'layout': await cmdLayout(ctx); break;
     case 'catch-script': await cmdCatchScript(ctx); break;
     case 'events': await cmdEvents(ctx); break;
@@ -1323,4 +1367,10 @@ main()
   })
   .finally(async () => {
     if (activeClient) await release(activeClient);
+    // A failure inside puppeteer.connect() can leave its socket open, which keeps Node alive after the error.
+    // Exit only on the error path: after a successful command, exiting could truncate a large stdout write.
+    if (process.exitCode) {
+      // An empty write's callback runs after the pending writes are flushed; process.exit() would drop them.
+      process.stderr.write('', () => process.exit(process.exitCode));
+    }
   });
