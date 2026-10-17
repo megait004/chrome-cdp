@@ -102,16 +102,16 @@ class VisualController {
     }
     await this._settle(); // first: the window can be covered while the page is still loading
     await this._dom.ensureVisible(); // a hidden window drops synthesized mouse events
-    const at = { x: x + ox, y: y + oy, button };
+    const at = { x: x + ox, y: y + oy };
     const pressed = { left: 1, right: 2, middle: 4 }[button]; // bitmask of the buttons held down
-    await this._cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...at, buttons: 0 });
+    await this._cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...at, button: 'none', buttons: 0 });
     // Chromium drops a press that arrives in the same frame as the move it follows
     await new Promise((r) => setTimeout(r, 50));
-    await this._cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at, buttons: pressed, clickCount });
+    await this._cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at, button, buttons: pressed, clickCount });
     // A human press lasts ~100 ms. Games poll the button once per frame, so an instant release
     // can be missed entirely when the app polls button state once per frame.
     await new Promise((r) => setTimeout(r, 100));
-    await this._cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...at, buttons: 0, clickCount });
+    await this._cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...at, button, buttons: 0, clickCount });
   }
 
   /**

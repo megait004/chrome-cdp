@@ -84,7 +84,7 @@ while the index includes the Function wrapper's offset for a payload built by `n
 
 ### Script with no URL
 
-A script the page creates at runtime (`eval`, `Function`, a decoded payload) has `url: ''`. CDP still lists it with a scriptId; DevTools names it `VM<id>`.
+A script the page creates at runtime (`eval`, `Function`, a decoded payload) has `url: ''`. CDP still lists it with a scriptId.
 
 - URL substring searches never match it. Content search does: `search-sources` covers every loaded script, including empty-URL ones.
 - To list them: `node cli.js vm-scripts`. To find a function in one of them: `node cli.js find-function <scriptId> <name>`. The API equivalents are `client.sources.listDynamicScripts()` and `findFunction()`. If you write your own script, call `disconnect()` in a `finally`; an error thrown before it leaves the process waiting until the timeout.

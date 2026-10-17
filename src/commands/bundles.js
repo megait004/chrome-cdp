@@ -36,9 +36,11 @@ function createBundleCommands({ attach, emit, release, isHttpUrl, T }) {
 
     // CLI args are plain strings; the API needs a RegExp instance for regex search.
     // A leading '/' gets path-mangled by Git Bash (MSYS), so regex is opt-in via --re.
+    // caseSensitive is pinned false: this RegExp is built here and carries no flags, so without it the
+    // API would read `!ignoreCase` as "the user wants case-sensitive" and --re would silently change.
     const searchQuery = useRegex ? new RegExp(query) : query;
 
-    const results = await client.sources.searchInSources(searchQuery);
+    const results = await client.sources.searchInSources(searchQuery, { caseSensitive: false });
     await emit({ query, count: results.length, matches: results }, outFile);
 
     await release(client);

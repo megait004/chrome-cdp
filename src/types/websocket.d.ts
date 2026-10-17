@@ -5,7 +5,9 @@ export interface WsFrame {
   requestId: string;
   url: string;
   direction: 'sent' | 'received';
+  /** CDP MonotonicTime: seconds since an arbitrary point in the past, not epoch seconds. */
   timestamp: number;
+  /** CDP TimeSinceEpoch: Unix epoch **seconds** — the same unit as WsSocket.startTime/endTime. */
   wallTime: number;
   opcode: number;
   payloadData: string;
@@ -19,9 +21,15 @@ export interface WsSocket {
   requestId: string;
   url: string;
   initiator: Protocol.Network.Initiator | null;
+  /** CDP TimeSinceEpoch: Unix epoch **seconds**. */
   startTime: number;
+  /** CDP TimeSinceEpoch: Unix epoch **seconds**; unset while the socket never reported a close. */
   endTime?: number;
-  handshakeRequest: { headers: Protocol.Network.Headers; wallTime: number } | null;
+  handshakeRequest: {
+    headers: Protocol.Network.Headers;
+    /** CDP TimeSinceEpoch: Unix epoch **seconds**. */
+    wallTime: number;
+  } | null;
   handshakeResponse: {
     status: number | undefined;
     statusText: string | undefined;

@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { messageOf, sleep } = require('./util');
+const { messageOf, sleep, safeDecode } = require('./util');
 const { waitUntil } = require('./waiting');
 
 /** @typedef {import('puppeteer-core').CDPSession} CDPSession */
@@ -63,7 +63,7 @@ const STORAGE_JS = `(() => {
 function localSegments(urlStr) {
   const u = new URL(urlStr);
   const clean = (/** @type {string} */ s) => s.replace(/[<>:"|?*\x00-\x1f]/g, '_');
-  const segs = decodeURIComponent(u.pathname).split('/').filter(Boolean).map((s) => (s === '..' ? '_' : clean(s)));
+  const segs = safeDecode(u.pathname).split('/').filter(Boolean).map((s) => (s === '..' ? '_' : clean(s)));
   if (u.pathname.endsWith('/') || segs.length === 0) segs.push('index.html');
   if (u.search) {
     // Same path, different query = different file. Hash the query into the name.
@@ -136,7 +136,11 @@ function isAlive(pid) {
 
 /** @param {Recorder} rec @param {string} msg */
 function recLog(rec, msg) {
-  fs.appendFileSync(path.join(rec.runDir, 'recorder.log'), `${new Date().toISOString()} ${msg}\n`);
+  // Never throws: it is the error path of the recorder, and a failed log write (full disk, deleted run
+  // directory) must not turn a handled failure into a crash.
+  try {
+    fs.appendFileSync(path.join(rec.runDir, 'recorder.log'), `${new Date().toISOString()} ${msg}\n`);
+  } catch {}
 }
 
 /** @param {Recorder} rec @param {string} file @param {object} obj */
@@ -344,7 +348,9 @@ function watch(rec, session, tag) {
   session.on('Network.loadingFinished', (e) => {
     rec.lastActivity = Date.now();
     /** @type {Promise<void>} */
-    const p = saveBody(rec, session, tag, e.requestId).finally(() => rec.pending.delete(p));
+    const p = saveBody(rec, session, tag, e.requestId)
+      .catch((err) => recLog(rec, `saveBody ${tag}:${e.requestId}: ${messageOf(err)}`))
+      .finally(() => rec.pending.delete(p));
     rec.pending.add(p);
   });
   session.on('Network.loadingFailed', (e) => {

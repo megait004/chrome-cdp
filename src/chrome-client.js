@@ -4,7 +4,7 @@
 const puppeteer = require('puppeteer-extra').default;
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { PROTOCOL_TIMEOUT_MS, GOTO_TIMEOUT_MS, UNRESPONSIVE_WAIT_MS, CLEANUP_WAIT_MS } = require('./timeouts');
-const { settleWithin, sleep } = require('./util');
+const { settleWithin, messageOf } = require('./util');
 
 const DOMController = require('./dom-controller');
 const NetworkController = require('./network-controller');
@@ -107,10 +107,17 @@ class ChromeClient {
       const targets = allTargets.filter((target) => target.type() === 'page');
       const tab = options.tab ?? 0;
       if (tab >= targets.length) throw new Error(`Tab ${tab} does not exist: Chrome has ${targets.length} tab(s). List them with: node cli.js tabs`);
-      const page = await Promise.race([
-        targets[tab].page().catch(() => null),
-        sleep(UNRESPONSIVE_WAIT_MS).then(() => null),
-      ]);
+      // An owned timer, not a race against sleep(): Promise.race does not cancel the loser, and the
+      // pending sleep(3000) kept the event loop — and so the CLI — alive for the rest of the budget
+      // after the command was already done. Clearing it in both branches ends the process at once.
+      /** @type {import('puppeteer-core').Page | null} */
+      const page = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), UNRESPONSIVE_WAIT_MS);
+        targets[tab].page().then(
+          (target) => { clearTimeout(timer); resolve(target); },
+          () => { clearTimeout(timer); resolve(null); },
+        );
+      });
       if (!page) {
         // note: ceiling — close and goto cannot run on a busy-loop tab, because puppeteer needs a page
         // handle and page setup itself needs the renderer. Upgrade path if this bites again: close via
@@ -132,12 +139,24 @@ class ChromeClient {
       // then runs with the recording it got, instead of failing before it starts (status, close, goto).
       if (options.autoEnableAll !== false) {
         await settleWithin(
-          Promise.all([
-            client.network.startRecording(),
-            client.websocket.startRecording(),
-            client.console.startRecording(),
-            client.sources.enable(),
-          ]),
+          (async () => {
+            // Network.enable is issued first, and it is the only one: a second, parameterless
+            // Network.enable resets the durable-message buffer size that startRecording() configures
+            // right after it (NetworkHandler::Enable zeroes durable_message_max_total_size_), so the
+            // websocket controller is told not to send its own. It is awaited *last* so that a blocked
+            // renderer hanging on Network.enable cannot starve the domains it can still answer.
+            const network = client.network.startRecording().catch((err) => {
+              // Name this failure here: when the other domains also fail, settleWithin can only report
+              // its own timeout, and the reason the traffic is empty would be lost.
+              process.stderr.write(`[warn] Network domain not enabled (${messageOf(err)}); traffic will be empty.\n`);
+            });
+            await Promise.all([
+              client.websocket.startRecording({ enableNetwork: false }),
+              client.console.startRecording(),
+              client.sources.enable(),
+            ]);
+            await network;
+          })(),
           UNRESPONSIVE_WAIT_MS,
           'enabling the recording domains (traffic, events, console, script search will be empty)'
         );
@@ -162,12 +181,18 @@ class ChromeClient {
 
     if (options.autoEnableAll !== false) {
       await settleWithin(
-        Promise.all([
-          client.network.startRecording(),
-          client.websocket.startRecording(),
-          client.console.startRecording(),
-          client.sources.enable(),
-        ]),
+        (async () => {
+          // Same ordering as connect(): one Network.enable, issued first, awaited last. See there.
+          const network = client.network.startRecording().catch((err) => {
+            process.stderr.write(`[warn] Network domain not enabled (${messageOf(err)}); traffic will be empty.\n`);
+          });
+          await Promise.all([
+            client.websocket.startRecording({ enableNetwork: false }),
+            client.console.startRecording(),
+            client.sources.enable(),
+          ]);
+          await network;
+        })(),
         UNRESPONSIVE_WAIT_MS,
         'enabling the recording domains (traffic, events, console, script search will be empty)'
       );

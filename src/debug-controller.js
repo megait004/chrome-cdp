@@ -45,8 +45,13 @@ function writePauseMarker(ev, scriptUrls) {
 function clearPauseMarker({ force = false } = {}) {
   if (!fs.existsSync(PAUSE_MARKER)) return;
   if (!force) {
-    const mine = JSON.parse(fs.readFileSync(PAUSE_MARKER, 'utf8')).pid === process.pid;
-    if (!mine) return;
+    try {
+      const mine = JSON.parse(fs.readFileSync(PAUSE_MARKER, 'utf8')).pid === process.pid;
+      if (!mine) return;
+    } catch {
+      fs.rmSync(PAUSE_MARKER, { force: true });
+      return;
+    }
   }
   fs.rmSync(PAUSE_MARKER, { force: true });
 }
@@ -57,8 +62,14 @@ function clearPauseMarker({ force = false } = {}) {
  */
 function readPauseMarker() {
   if (!fs.existsSync(PAUSE_MARKER)) return null;
-  const marker = JSON.parse(fs.readFileSync(PAUSE_MARKER, 'utf8'));
-  if (isAlive(marker.pid)) return marker;
+  let marker;
+  try {
+    marker = JSON.parse(fs.readFileSync(PAUSE_MARKER, 'utf8'));
+  } catch {
+    fs.rmSync(PAUSE_MARKER, { force: true });
+    return null;
+  }
+  if (marker && isAlive(marker.pid)) return marker;
   fs.rmSync(PAUSE_MARKER, { force: true });
   return null;
 }

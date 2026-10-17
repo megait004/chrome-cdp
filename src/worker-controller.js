@@ -89,9 +89,12 @@ class WorkerController extends EventEmitter {
   }
   /** @param {import('puppeteer-core').Target} target */
   _onTargetDestroyed(target) {
-    const item = this._workers.get(this._targetIds.get(target));
+    const targetId = this._targetIds.get(target);
+    this._targetIds.delete(target);
+    const item = this._workers.get(targetId);
     if (!item) return;
     this._workers.delete(item.id);
+    item.session.detach().catch(() => {});
     this.emit('destroyed', this.info(item));
   }
   /** @param {{ id: string, type: string | null, url: string }} item */
@@ -107,7 +110,13 @@ class WorkerController extends EventEmitter {
     const result = await this._get(id).session.send('Runtime.evaluate', {
       expression, awaitPromise: options.awaitPromise !== false, returnByValue: true,
     });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'Worker evaluation failed');
+    if (result.exceptionDetails) {
+      throw new Error(
+        result.exceptionDetails.exception?.description ||
+        result.exceptionDetails.text ||
+        'Worker evaluation failed'
+      );
+    }
     return result.result?.value;
   }
 

@@ -37,7 +37,16 @@ class ConsoleController extends EventEmitter {
     this._cdp.on('Runtime.consoleAPICalled', this._onConsoleAPICalled);
     this._cdp.on('Runtime.exceptionThrown', this._onExceptionThrown);
 
-    await this._cdp.send('Runtime.enable');
+    try {
+      await this._cdp.send('Runtime.enable');
+    } catch (error) {
+      // Enable failed, so _isRecording stays false and a later startRecording() would arm these
+      // handlers a second time — every message would then be recorded twice. Undo, then rethrow so
+      // the caller gets to report it.
+      this._cdp.off('Runtime.consoleAPICalled', this._onConsoleAPICalled);
+      this._cdp.off('Runtime.exceptionThrown', this._onExceptionThrown);
+      throw error;
+    }
     this._isRecording = true;
   }
 

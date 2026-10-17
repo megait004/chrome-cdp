@@ -252,8 +252,11 @@ class DOMController {
     await this.ensureVisible(); // occluded windows swallow synthesized keys
     await this._page.type(selector, text, { delay });
     // Verify the keys landed; if the revive failed they were dropped silently.
-    const readBack = await this.getValue(selector).catch(() => null);
-    if (readBack === null || !String(readBack).includes(text)) {
+    const readBack = await this._page.$eval(selector, (node) => {
+      const el = /** @type {HTMLElement & { value?: unknown }} */ (node);
+      return typeof el.value === 'string' ? el.value : el.textContent;
+    }).catch(() => null);
+    if (readBack === null || !readBack.includes(text)) {
       // note: fallback is CDP Input.insertText — delivered even while occluded
       // (reported behaviour). Focus + select-all first, so it replaces the content
       // deterministically instead of appending at an unknown cursor. It fires
@@ -434,23 +437,29 @@ class DOMController {
       throw new Error(`Target not found for event listeners: ${target}`);
     }
 
-    // depth -1 covers the whole subtree under the object, so one call on the document lists every element's listeners
-    const response = await this._cdp.send('DOMDebugger.getEventListeners', {
-      objectId: result.objectId,
-      depth: -1,
-      pierce: Boolean(options.pierce),
-    });
+    try {
+      // depth -1 covers the whole subtree under the object, so one call on the document lists every element's listeners
+      const response = await this._cdp.send('DOMDebugger.getEventListeners', {
+        objectId: result.objectId,
+        depth: -1,
+        pierce: Boolean(options.pierce),
+      });
 
-    return (response.listeners || []).map((l) => ({
-      type: l.type,
-      useCapture: l.useCapture,
-      passive: l.passive,
-      once: l.once,
-      scriptId: l.scriptId,
-      lineNumber: l.lineNumber,
-      columnNumber: l.columnNumber,
-      handlerDescription: l.handler?.description || null,
-    }));
+      return (response.listeners || []).map((l) => ({
+        type: l.type,
+        useCapture: l.useCapture,
+        passive: l.passive,
+        once: l.once,
+        scriptId: l.scriptId,
+        lineNumber: l.lineNumber,
+        columnNumber: l.columnNumber,
+        handlerDescription: l.handler?.description || null,
+      }));
+    } finally {
+      // Fire and forget: the listeners are already parsed, and a blocked renderer never answers this —
+      // awaiting it would hang the command after its work is done. The release still has to happen.
+      this._cdp.send('Runtime.releaseObject', { objectId: result.objectId }).catch(() => {});
+    }
   }
 
   /**
