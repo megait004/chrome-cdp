@@ -104,7 +104,9 @@ class SourceController extends EventEmitter {
         const { source } = await this.getScriptSource(s.scriptId);
         return { ...base, head: source.slice(0, 100).replace(/\s+/g, ' ') };
       } catch (err) {
-        // A script can be unreadable (WebAssembly, or a context that was cleared); report that per row
+        // A script can be unreadable when its context was cleared (WebAssembly never lands here: it is
+        // listed under wasm://wasm/<hash>, so it is not one of the URL-less scripts this method lists);
+        // report that per row
         // instead of failing the whole listing.
         return { ...base, head: null, error: messageOf(err) };
       }
@@ -211,7 +213,7 @@ class SourceController extends EventEmitter {
 
     try {
       const result = await this._cdp.send('Debugger.getScriptSource', { scriptId });
-      if (result?.scriptSource) {
+      if (typeof result?.scriptSource === 'string') {
         return {
           scriptId,
           url: meta.url,
@@ -258,12 +260,16 @@ class SourceController extends EventEmitter {
       ? [{ scriptId: this._resolveScriptId(options.scriptId) }]
       : this.getScripts({ excludeInternal: options.excludeInternal !== false });
 
+    const caseSensitive = options.caseSensitive !== undefined
+      ? Boolean(options.caseSensitive)
+      : (isRegex ? !query.ignoreCase : false);
+
     const found = await Promise.all(targets.map(async (target) => {
       try {
         const response = await this._cdp.send('Debugger.searchInContent', {
           scriptId: target.scriptId,
           query: searchQuery,
-          caseSensitive: Boolean(options.caseSensitive),
+          caseSensitive,
           isRegex: isRegex || Boolean(options.isRegex),
         });
 

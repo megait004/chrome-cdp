@@ -44,6 +44,16 @@ function isHttpUrl(s) {
   return typeof s === 'string' && /^https?:\/\//i.test(s);
 }
 
+/**
+ * Seconds since `startedAt`, to 2 decimals. What a caller wants to know about a wait is the time it
+ * actually took, not the budget it was given.
+ * @param {number} startedAt
+ * @returns {number}
+ */
+function elapsedSeconds(startedAt) {
+  return Math.round((Date.now() - startedAt) / 10) / 100;
+}
+
 const SLOW = Symbol('slow');
 
 /**
@@ -59,8 +69,13 @@ async function untilNotPaused(work) {
   const slow = new Promise((resolve) => {
     timer = setTimeout(() => resolve(SLOW), 3000);
   });
-  const first = await Promise.race([work, slow]);
-  clearTimeout(timer);
+  /** @type {T | typeof SLOW} */
+  let first;
+  try {
+    first = await Promise.race([work, slow]);
+  } finally {
+    clearTimeout(timer); // every branch: a rejection from `work` must not leave the 3 s timer pending
+  }
   if (first !== SLOW) return /** @type {T} */ (first);
   // A pause held by another live CLI command (its breakpoint is still waiting): name the stop point.
   const held = DebugController.readPauseMarker();
@@ -79,7 +94,8 @@ Commands:
                                 there first; omit it to read the tab as it is)
   listeners [url] [selector]    Audit event listeners on target selector or 'window'
   search-sources [url] <query>  Search across all loaded script bundles. Plain query =
-                                case-insensitive substring; use --re for regex
+                                case-insensitive substring; use --re for regex (also
+                                case-insensitive)
   download-bundle [url] <queryOrId> <destFile>
                                 Download matching script bundle to local file
   deobfuscate [url] <queryOrId> [destFile]
@@ -134,7 +150,8 @@ Commands:
                                 Set a Debugger breakpoint (URL substring match) and wait
                                 for the hit. Line is SCRIPT-relative and 0-based: line N
                                 of the source as shown by search-sources/getScriptSource
-                                (inline <script> blocks are auto-offset). Flags:
+                                (inline <script> blocks are auto-offset once the script is loaded; an
+                                unmatched query is a URL substring, so add the offset yourself). Flags:
                                 --col N, --condition <expr>, --eval <expr> (runs on the
                                 top call frame), --timeout S (default 15), --hold
                                 (ignored: Chrome resumes when the command exits),
@@ -1191,12 +1208,15 @@ async function cmdWait({ args, port, outFile, isJson }) {
   const tIdx = args.indexOf('--timeout');
   const timeout = tIdx !== -1 ? Number(args[tIdx + 1]) * 1000 : T.CLI_ACTION_TIMEOUT_MS;
   if (!Number.isFinite(timeout) || timeout < 0) throw new Error('Usage: node cli.js wait [url] <selector> [--timeout S] — S must be seconds, e.g. --timeout 10');
+  const startedAt = Date.now();
   try {
     await client.page.waitForSelector(selector, { timeout, visible: true });
     const text = await client.dom.getText(selector).catch(() => null);
-    await emit({ ok: true, selector, waitedSeconds: timeout / 1000, text: text ? String(text).slice(0, 80) : undefined }, outFile);
+    await emit({ ok: true, selector, waitedSeconds: elapsedSeconds(startedAt), text: text ? String(text).slice(0, 80) : undefined }, outFile);
   } catch {
-    // Timeout is a page-state answer, not a bug: say what IS there.
+    // Timeout is a page-state answer, not a bug: say what IS there. Read the clock first: the
+    // snapshot below costs time of its own and is not part of what the wait spent.
+    const waited = elapsedSeconds(startedAt);
     const snap = await client.dom.interactiveSnapshot().catch(() => null);
     const lines = snap ? interactiveHints(snap.elements) : [];
     // Say why it failed: a missing element and an element that exists but has no size are different fixes.
@@ -1216,7 +1236,6 @@ async function cmdWait({ args, port, outFile, isJson }) {
       reason = 'exists-not-visible';
       why = `"${selector}" exists but is not visible (${state.width}x${state.height}px, display: ${state.display}, visibility: ${state.visibility}). wait needs a visible element.`;
     }
-    const waited = timeout / 1000;
     if (isJson) {
       // Machine-readable failure: the same facts as the message, in fields an agent can branch on.
       await emit({ ok: false, selector, reason, waitedSeconds: waited, state, interactive: lines }, outFile);

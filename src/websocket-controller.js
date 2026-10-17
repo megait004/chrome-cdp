@@ -3,6 +3,16 @@
 const EventEmitter = require('node:events');
 const matchesQuery = require('./match-query');
 
+/**
+ * Self-generated times are Unix epoch seconds, the unit CDP's TimeSinceEpoch uses. Frames also carry
+ * `timestamp` (MonotonicTime, also seconds) straight from the protocol, so mixing Date.now()'s
+ * milliseconds into `wallTime`/`startTime`/`endTime` would put two scales on one socket.
+ * @returns {number}
+ */
+function nowEpochSeconds() {
+  return Date.now() / 1000;
+}
+
 /** @typedef {import('./types/websocket').WsSocket} WsSocket */
 /** @typedef {import('./types/websocket').WsFrame} WsFrame */
 
@@ -29,9 +39,16 @@ class WebSocketController extends EventEmitter {
   }
 
   /**
+   * @param {{ enableNetwork?: boolean }} [options] enableNetwork sends Network.enable, which is what
+   *   delivers the webSocket* events on a session that enabled nothing else. chrome-client passes
+   *   false: its network controller already enabled the domain on this same session, and a second,
+   *   parameterless Network.enable resets the durable-message buffer size that startRecording()
+   *   configured right after it (NetworkHandler::Enable zeroes durable_message_max_total_size_).
+   *   Restarting this controller by hand with the default sends that second enable: stop and start
+   *   `client.network` too if the durable bodies are still needed.
    * @returns {Promise<void>}
    */
-  async startRecording() {
+  async startRecording({ enableNetwork = true } = {}) {
     if (this._isRecording) return;
 
     this._cdp.on('Network.webSocketCreated', this._onSocketCreated);
@@ -42,7 +59,21 @@ class WebSocketController extends EventEmitter {
     this._cdp.on('Network.webSocketFrameError', this._onFrameError);
     this._cdp.on('Network.webSocketClosed', this._onSocketClosed);
 
-    await this._cdp.send('Network.enable');
+    try {
+      if (enableNetwork) await this._cdp.send('Network.enable');
+    } catch (error) {
+      // Enable failed, so _isRecording stays false and a later startRecording() would arm these
+      // handlers a second time — every frame would then be recorded twice. Undo, then rethrow so the
+      // caller gets to report it.
+      this._cdp.off('Network.webSocketCreated', this._onSocketCreated);
+      this._cdp.off('Network.webSocketWillSendHandshakeRequest', this._onHandshakeReq);
+      this._cdp.off('Network.webSocketHandshakeResponseReceived', this._onHandshakeRes);
+      this._cdp.off('Network.webSocketFrameSent', this._onFrameSent);
+      this._cdp.off('Network.webSocketFrameReceived', this._onFrameRecv);
+      this._cdp.off('Network.webSocketFrameError', this._onFrameError);
+      this._cdp.off('Network.webSocketClosed', this._onSocketClosed);
+      throw error;
+    }
     this._isRecording = true;
   }
 
@@ -158,7 +189,7 @@ class WebSocketController extends EventEmitter {
         requestId,
         url,
         initiator: null,
-        startTime: Date.now(),
+        startTime: nowEpochSeconds(),
         handshakeRequest: null,
         handshakeResponse: null,
         state: 'connecting',
@@ -204,7 +235,7 @@ class WebSocketController extends EventEmitter {
     const sock = this._getOrCreateSocket(event.requestId);
     sock.handshakeRequest = {
       headers: event.request?.headers || {},
-      wallTime: event.wallTime || Date.now() / 1000,
+      wallTime: event.wallTime || nowEpochSeconds(),
     };
     this.emit('handshakeRequest', { requestId: event.requestId, ...sock.handshakeRequest });
   }
@@ -244,7 +275,7 @@ class WebSocketController extends EventEmitter {
       url: sock.url,
       direction: 'sent',
       timestamp: event.timestamp,
-      wallTime: Date.now(),
+      wallTime: nowEpochSeconds(),
       opcode: frameData.opcode, // 1: text, 2: binary, 8: close, 9: ping, 10: pong
       payloadData: frameData.payloadData,
       isBinary: frameData.opcode === 2,
@@ -270,7 +301,7 @@ class WebSocketController extends EventEmitter {
       url: sock.url,
       direction: 'received',
       timestamp: event.timestamp,
-      wallTime: Date.now(),
+      wallTime: nowEpochSeconds(),
       opcode: frameData.opcode,
       payloadData: frameData.payloadData,
       isBinary: frameData.opcode === 2,
@@ -303,7 +334,7 @@ class WebSocketController extends EventEmitter {
   _onSocketClosed(event) {
     const sock = this._getOrCreateSocket(event.requestId);
     sock.state = 'closed';
-    sock.endTime = Date.now();
+    sock.endTime = nowEpochSeconds();
     this.emit('socketClosed', { requestId: event.requestId, timestamp: event.timestamp });
   }
 }

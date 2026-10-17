@@ -19,8 +19,8 @@ const { messageOf } = require('./util');
  * @property {import('devtools-protocol').Protocol.Network.Request['headers']} headers
  * @property {import('devtools-protocol').Protocol.Network.RequestWillBeSentExtraInfoEvent['headers'] | null} rawHeaders
  * @property {string | null} postData rebuilt from postDataEntries (postData itself is deprecated)
- * @property {number | null} startTime
- * @property {import('devtools-protocol').Protocol.Network.RequestWillBeSentEvent['wallTime']} [wallTime]
+ * @property {number | null} startTime MonotonicTime in milliseconds (CDP wallTime is epoch seconds; this is not).
+ * @property {import('devtools-protocol').Protocol.Network.RequestWillBeSentEvent['wallTime']} [wallTime] Unix epoch seconds, straight from CDP.
  * @property {import('devtools-protocol').Protocol.Network.Initiator} [initiator]
  * @property {import('devtools-protocol').Protocol.Network.Response['status'] | null} status
  * @property {import('devtools-protocol').Protocol.Network.Response['statusText'] | null} statusText
@@ -106,17 +106,30 @@ class NetworkController extends EventEmitter {
     this._cdp.on('Network.loadingFinished', this._onLoadingFinished);
     this._cdp.on('Network.loadingFailed', this._onLoadingFailed);
 
-    await this._cdp.send('Network.enable');
-    // note: store response bodies outside the renderer so they survive
-    // cross-process navigations (protocol v0.0.1716261, experimental — older
-    // Chrome builds reject the command, hence the silent catch). Without it,
-    // bodies die on navigation; this is what makes getResponseBody reliable.
-    // Trade-off: Network.searchInResponseBody may not see durable-stored bodies,
-    // so searchBodies() falls back to a local match.
-    await this._cdp.send('Network.configureDurableMessages', {
-      maxTotalBufferSize: 100_000_000,
-      maxResourceBufferSize: 5_000_000,
-    }).catch(() => {});
+    try {
+      await this._cdp.send('Network.enable');
+      // note: store response bodies outside the renderer so they survive
+      // cross-process navigations (protocol v0.0.1716261, experimental — older
+      // Chrome builds reject the command, hence the silent catch). Without it,
+      // bodies die on navigation; this is what makes getResponseBody reliable.
+      // Trade-off: Network.searchInResponseBody may not see durable-stored bodies,
+      // so searchBodies() falls back to a local match.
+      await this._cdp.send('Network.configureDurableMessages', {
+        maxTotalBufferSize: 100_000_000,
+        maxResourceBufferSize: 5_000_000,
+      }).catch(() => {});
+    } catch (error) {
+      // Enable failed, so _isRecording stays false and a later startRecording() would arm these
+      // handlers a second time — every request would then be recorded twice. Undo, then rethrow so
+      // the caller gets to report it.
+      this._cdp.off('Network.requestWillBeSent', this._onRequestWillBeSent);
+      this._cdp.off('Network.requestWillBeSentExtraInfo', this._onRequestExtraInfo);
+      this._cdp.off('Network.responseReceived', this._onResponseReceived);
+      this._cdp.off('Network.responseReceivedExtraInfo', this._onResponseExtraInfo);
+      this._cdp.off('Network.loadingFinished', this._onLoadingFinished);
+      this._cdp.off('Network.loadingFailed', this._onLoadingFailed);
+      throw error;
+    }
     this._isRecording = true;
   }
 
@@ -135,6 +148,8 @@ class NetworkController extends EventEmitter {
 
   clear() {
     this._entries.clear();
+    // Hops still waiting for raw headers belong to entries that no longer exist.
+    this._hopsAwaitingRaw.clear();
   }
 
   /**
@@ -597,6 +612,10 @@ class NetworkController extends EventEmitter {
       hop.rawResponseHeaders = event.headers;
       hop.rawResponseHeadersText = event.headersText || null;
       hop.rawStatusCode = event.statusCode;
+      // Last hop served: drop the key, or the map keeps one entry per redirecting request for the
+      // whole session. With nothing waiting the block above is skipped and the extra info lands on
+      // the live entry below, which is what a non-redirect response means.
+      if (waiting.length === 0) this._hopsAwaitingRaw.delete(event.requestId);
       return;
     }
     const entry = this._getOrCreateEntry(event.requestId);

@@ -127,16 +127,18 @@ Source: Chromium's Blink `core/` (`third_party/blink/renderer/core/` in the chro
 
 ```bash
 git clone --filter=blob:none --no-checkout --depth 1 https://github.com/chromium/chromium.git references/chromium
-git -C references/chromium sparse-checkout set third_party/blink/renderer/core/<dir> third_party/blink/renderer/core/<dir2>
+git -C references/chromium sparse-checkout set third_party/blink/common third_party/blink/renderer/core/css third_party/blink/renderer/core/dom third_party/blink/renderer/core/frame third_party/blink/renderer/core/html/parser third_party/blink/renderer/core/layout third_party/blink/renderer/core/paint third_party/blink/renderer/core/script third_party/blink/renderer/core/style
 git -C references/chromium checkout
 ```
+
+If `references/chromium` already exists, skip the clone and add dirs with `git -C references/chromium sparse-checkout add <dir>`. The list above covers this section only; the DevTools trace notes below need `content/browser/devtools`, `third_party/blink/renderer/core/inspector` and `v8/src/inspector`, and `v8/` is its own repository (`git -C references/chromium/v8 sparse-checkout add src/inspector`).
 
 - **Order per frame:** style, layout, compositing inputs, pre-paint, paint (`dom/document_lifecycle.h`, `frame/local_frame_view.cc` `UpdateLifecyclePhasesInternal`). Layout can run again inside the same frame when a step after layout dirties it again (the loop in that function).
 - **Reading layout forces it.** `offsetWidth` and the other geometry getters call `UpdateStyleAndLayoutForNode` synchronously (`dom/element.cc`, `OffsetWidth`). A write followed by a read in one task costs a full style and layout each time.
 - **`display: none` has no layout object**; `visibility: hidden` and `opacity: 0` do (`dom/element.cc`, `LayoutObjectIsNeeded`).
-- **A plain `transform` or `opacity` change does not get a compositor layer.** Only an active animation or `will-change` does (`paint/compositing/compositing_reason_finder.cc`). Without one, the change repaints.
-- **Parser waits for stylesheets.** A stylesheet in the body does not block paint, but the parser pauses while a parser-blocking stylesheet is pending (`html/parser/html_document_parser.cc`, `WaitingForStylesheets`).
-- **`async` is immediate by default.** Blink has an intervention, `DelayAsyncScriptExecution`, which is `FEATURE_DISABLED_BY_DEFAULT` (`blink/common/features.cc`). Only an enabled feature or field trial can delay an `async` script (`script/script_loader.cc`).
+- **A plain `transform` or `opacity` change does not get a compositor layer.** An active animation, `will-change`, or a 3D transform does (`paint/compositing/compositing_reason_finder.cc`, `PotentialCompositingReasonsFor3DTransform`), and so do `perspective` with 3D transformed descendants, `backdrop-filter` and others listed there. Without one, the change repaints.
+- **Parser waits for stylesheets.** A stylesheet in the body does not block paint, but the parser pauses while a parser-blocking stylesheet is pending (`html/parser/html_document_parser_state.h` defines `WaitingForStylesheets`; `html/parser/html_document_parser.h` pauses on it).
+- **`async` is immediate by default.** Blink has an intervention, `DelayAsyncScriptExecution`, which is `FEATURE_DISABLED_BY_DEFAULT` (`third_party/blink/common/features.cc`). Only an enabled feature or field trial can delay an `async` script (`script/script_loader.cc`).
 - **Paint is not caused by script.** A paint after a `requestAnimationFrame` callback runs in the frame, after the script returned. `layout` reports it as `(no script on stack)`: match it to the script by time, not by stack.
 
 ## Mapping what runs
