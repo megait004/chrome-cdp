@@ -9,10 +9,71 @@ const { gfm } = require('turndown-plugin-gfm');
 
 /** @typedef {import('./types/snapshot').SnapshotElement} SnapshotElement */
 /** @typedef {import('./types/snapshot').InteractiveSnapshot} InteractiveSnapshot */
+/** An element that may carry a form value, placeholder, name, type, href, or disabled flag. Each is optional: not every element has it. */
+/** @typedef {HTMLElement & { value?: string, placeholder?: string, name?: string, type?: string, href?: string, disabled?: boolean }} FormLikeElement */
+/** A form control as read by dumpForms; every property is optional because not every element has it. */
+/** @typedef {HTMLElement & { name?: string, type?: string, value?: string, required?: boolean, disabled?: boolean }} FormControlLike */
+/** One recorded postMessage event, sent by the page or received from another window. */
+/** @typedef {{ direction: 'sent' | 'received', origin?: string, targetOrigin?: string | WindowPostMessageOptions, data: unknown, timestamp: number }} PostMessageLog */
+/** The page window with the state that hookPostMessage keeps on it. */
+/** @typedef {Window & { __postMessageHookInstalled?: boolean, __postMessageLogs: PostMessageLog[] }} HookedWindow */
+
+// Page-side functions: puppeteer serializes the function it is given, so each one must be self-contained
+// (it cannot call its neighbours) — that is why the interactive-element selector is repeated where needed.
 
 /**
- * Controller for DOM queries, interactions, security inspections, and content extraction.
+ * Runs in the page. Scrolls the element into view and reports why it cannot be acted on.
+ * @param {Node} node
+ * @returns {string} '' when the element is actionable, else the reason
  */
+function refusalReasonInPage(node) {
+  const el = /** @type {HTMLElement & { disabled?: boolean }} */ (node);
+  if (typeof el.scrollIntoView === 'function') {
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+  }
+  if (el.disabled) return 'disabled';
+  const r = el.getBoundingClientRect();
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (hit && hit !== el && !el.contains(hit)) {
+    const label = hit.id ? '#' + hit.id : '';
+    return 'covered by <' + hit.tagName.toLowerCase() + label + '>';
+  }
+  return '';
+}
+
+/**
+ * Runs in the page: focus and click at DOM level, because a pointer click waits on IntersectionObserver
+ * in background windows.
+ * @param {Node} node
+ */
+function domClickInPage(node) {
+  const el = /** @type {HTMLElement} */ (node);
+  if (typeof el.focus === 'function') {
+    el.focus();
+  }
+  el.click();
+}
+
+/**
+ * Runs in the page: the interactive element whose visible text matches (exact beats substring).
+ * @param {string} target
+ * @returns {Element | null}
+ */
+function findTextElementInPage(target) {
+  const SELECTOR = 'a, button, [role=button], [role=tab], [onclick], summary, input[type=submit], input[type=button]';
+  const norm = (/** @type {string | null | undefined} */ s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = norm(target);
+  let exact = null, partial = null;
+  for (const el of /** @type {NodeListOf<FormLikeElement>} */ (document.querySelectorAll(SELECTOR))) {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    const t = norm(el.innerText || el.value);
+    if (t === want) { exact = el; break; }
+    if (!partial && t.includes(want)) partial = el;
+  }
+  return exact || partial;
+}
+
 class DOMController {
   /**
    * @param {import('puppeteer-core').Page} page
@@ -25,13 +86,8 @@ class DOMController {
   }
 
   /**
-   * Revives an occluded window before keyboard interaction. When the Chrome
-   * window is covered or on an unshown virtual desktop (`visibilityState:
-   * 'hidden'` even with `hasFocus()` true), Chromium silently drops
-   * synthesized keyboard input — keyboard.type() produces no events at all.
-   * A minimized→normal bounds dance forces real window activation. Needs a
-   * visible window, so no automated test covers it; bringToFront and
-   * setWebLifecycleState were reported not to help.
+   * Brings the window back to visible before keyboard input. A hidden window drops synthesized keys without an error;
+   * a minimize-then-restore forces the real activation.
    * @returns {Promise<void>}
    */
   async ensureVisible() {
@@ -45,10 +101,9 @@ class DOMController {
     const awaitState = async (/** @type {string} */ want, /** @type {number} */ ms) => {
       const end = Date.now() + ms;
       while (Date.now() < end) {
-        // Sampling loop: must observe one state before deciding whether to wait again.
         const state = await this._page.evaluate(() => document.visibilityState).catch(() => null); // NOSONAR S9382
         if (state === want) return;
-        await new Promise((r) => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 50)); // NOSONAR S9382
       }
     };
     try {
@@ -61,7 +116,6 @@ class DOMController {
   }
 
   /**
-   * Finds a single element matching selector.
    * @param {string} selector
    * @returns {Promise<import('puppeteer-core').ElementHandle | null>}
    */
@@ -70,9 +124,7 @@ class DOMController {
   }
 
   /**
-   * Compact list of interactive elements currently in the DOM — the agent's
-   * eyes. Read this before acting and after every action, so selectors are
-   * picked from what the page actually shows, not from memory.
+   * Lists the interactive elements in the DOM, so selectors come from what the page shows now.
    * @param {string} [selector] restrict the scan to a subtree
    * @param {import('puppeteer-core').Frame | import('puppeteer-core').Page} [frame] scan this frame instead of the page (iframes, games)
    * @returns {Promise<InteractiveSnapshot | null>}
@@ -83,16 +135,18 @@ class DOMController {
       const root = scope ? document.querySelector(scope) : document;
       if (!root) return null;
       const clean = (/** @type {string | null | undefined} */ s, /** @type {number} */ n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
-      const seen = new Set();
+      // No dedupe by tag+id+text: querySelectorAll returns each element once, so such a key can only
+      // collapse distinct elements (two unnamed inputs with no text look identical).
       const elements = [];
-      for (const el of /** @type {NodeListOf<any>} */ (root.querySelectorAll(SELECTOR))) {
+      let matched = 0;
+      for (const el of /** @type {NodeListOf<FormLikeElement>} */ (root.querySelectorAll(SELECTOR))) {
         const cs = getComputedStyle(el);
         if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        // count reports every interactive element; the list stops at 150 so the reply stays small.
+        matched += 1;
+        if (elements.length >= 150) continue;
         const rect = el.getBoundingClientRect();
         const text = clean(el.innerText || el.value || el.placeholder, 60);
-        const key = el.tagName + '|' + el.id + '|' + text;
-        if (seen.has(key)) continue;
-        seen.add(key);
         elements.push({
           tag: el.tagName.toLowerCase(),
           id: el.id || undefined,
@@ -105,41 +159,40 @@ class DOMController {
           disabled: el.disabled || undefined,
           inViewport: (rect.top < innerHeight && rect.bottom > 0) || undefined,
         });
-        if (elements.length >= 150) break;
       }
-      return { url: location.href, readyState: document.readyState, count: elements.length, elements };
+      return { url: location.href, readyState: document.readyState, count: matched, truncated: matched > elements.length || undefined, elements };
     }, selector || '');
   }
 
   /**
    * Human-style click: find the interactive element whose visible text matches
-   * (exact match wins over substring, case-insensitive) and click it.
+   * (exact match wins over substring, case-insensitive) and click it through the same
+   * disabled/covered check the selector path uses.
    * @param {string} text
    * @returns {Promise<{ tag: string, text: string } | null>} what was clicked, or null if nothing matched
    */
   async clickByText(text) {
-    return this._page.evaluate((target) => {
-      const SELECTOR = 'a, button, [role=button], [role=tab], [onclick], summary, input[type=submit], input[type=button]';
-      const norm = (/** @type {string | null | undefined} */ s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const want = norm(target);
-      let exact = null, partial = null;
-      for (const el of /** @type {NodeListOf<any>} */ (document.querySelectorAll(SELECTOR))) {
-        const cs = getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-        const t = norm(el.innerText || el.value);
-        if (t === want) { exact = el; break; }
-        if (!partial && t.includes(want)) partial = el;
-      }
-      const el = exact || partial;
-      if (!el) return null;
-      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center', inline: 'center' });
-      el.click();
-      return { tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 60) };
-    }, text);
+    const handle = await this._page.evaluateHandle(findTextElementInPage, text);
+    const element = handle.asElement();
+    if (!element) {
+      await handle.dispose();
+      return null;
+    }
+    try {
+      const info = await element.evaluate((node) => {
+        const el = /** @type {HTMLElement & { value?: string }} */ (node);
+        return { tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 60) };
+      });
+      const why = await element.evaluate(refusalReasonInPage).catch(() => '');
+      if (why) throw new Error(`click refused: text=${text} is ${why}. Nothing was clicked.`);
+      await element.evaluate(domClickInPage);
+      return info;
+    } finally {
+      await element.dispose().catch(() => {});
+    }
   }
 
   /**
-   * Presses a keyboard key on the focused element (Enter, Tab, Escape, ...).
    * @param {import('puppeteer-core').KeyInput} key
    * @returns {Promise<void>}
    */
@@ -149,7 +202,6 @@ class DOMController {
   }
 
   /**
-   * Finds all elements matching selector.
    * @param {string} selector
    * @returns {Promise<Array<import('puppeteer-core').ElementHandle>>}
    */
@@ -158,26 +210,28 @@ class DOMController {
   }
 
   /**
-   * Clicks an element matching selector.
-   * Uses direct DOM focus and click to prevent IntersectionObserver hang in background/minimized windows.
+   * Clicks an element. Uses DOM focus and click, because a pointer click waits on IntersectionObserver in background windows.
    * @param {string} selector
    * @param {{ timeout?: number } & import('puppeteer-core').ClickOptions} [options]
    *   timeout (ms) bounds the wait for the element; the rest goes to the page.click fallback.
    */
   async click(selector, { timeout, ...clickOptions } = {}) {
     await this._page.waitForSelector(selector, { timeout });
-    try {
-      await this._page.$eval(selector, (/** @type {any} */ el) => {
-        if (typeof el.scrollIntoView === 'function') {
-          el.scrollIntoView({ block: 'center', inline: 'center' });
-        }
-        if (typeof el.focus === 'function') {
-          el.focus();
-        }
-        el.click();
-      });
-    } catch {
+    const handle = await this._page.$(selector);
+    if (!handle) {
       await this._page.click(selector, clickOptions);
+      return;
+    }
+    try {
+      // Refuse a silent no-op: a disabled element ignores el.click(), and a covering element takes it instead.
+      const why = await handle.evaluate(refusalReasonInPage).catch(() => '');
+      if (why) throw new Error(`click refused: ${selector} is ${why}. Nothing was clicked.`);
+      await handle.evaluate(domClickInPage).catch(async () => {
+        // Detached or stale handle: fall back to a real pointer click.
+        await this._page.click(selector, clickOptions);
+      });
+    } finally {
+      await handle.dispose().catch(() => {});
     }
   }
 
@@ -190,19 +244,25 @@ class DOMController {
    */
   async type(selector, text, { timeout, delay } = {}) {
     await this._page.waitForSelector(selector, { visible: true, timeout });
+    // Same refusal as click: a disabled field ignores the keys, a covered one types into the overlay.
+    const handle = await this._page.$(selector);
+    const why = handle ? await handle.evaluate(refusalReasonInPage).catch(() => '') : '';
+    await handle?.dispose().catch(() => {});
+    if (why) throw new Error(`type refused: ${selector} is ${why}. Nothing was typed.`);
     await this.ensureVisible(); // occluded windows swallow synthesized keys
     await this._page.type(selector, text, { delay });
     // Verify the keys landed; if the revive failed they were dropped silently.
     const readBack = await this.getValue(selector).catch(() => null);
     if (readBack === null || !String(readBack).includes(text)) {
       // note: fallback is CDP Input.insertText — delivered even while occluded
-      // (reported behaviour; no automated test). Focus + select-all first, so it replaces the content
+      // (reported behaviour). Focus + select-all first, so it replaces the content
       // deterministically instead of appending at an unknown cursor. It fires
       // only an `input` event, no keydown/keyup — keystroke-dependent UIs
       // (autocomplete-on-keypress) may need a visible window; upgrade path:
       // per-key insertText loop.
       await this._page.evaluate((sel) => {
-        const el = /** @type {any} */ (document.querySelector(sel));
+        // note: the caller passes inputs and textareas; any other element throws in setSelectionRange and is skipped by the try below.
+        const el = /** @type {HTMLInputElement | HTMLTextAreaElement | null} */ (document.querySelector(sel));
         if (!el) throw new Error(`Element not found: ${sel}`);
         el.focus();
         // setSelectionRange throws InvalidStateError on email/number inputs —
@@ -215,13 +275,8 @@ class DOMController {
   }
 
   /**
-   * Clears existing value and sets new value for an input or textarea element.
-   * Goes through the element prototype's native value setter: frameworks like
-   * React track the last value on the element and ignore plain `.value =`
-   * assignment, so the synthetic event would carry no change. The native
-   * setter bypasses that tracker and `input`/`change` then carry the update.
-   * If the app still ignores it, use `type()` — real per-key events are what
-   * framework-controlled inputs can never dedupe away.
+   * Sets a field's value through the native setter. Frameworks such as React ignore a plain `.value =`, so the change
+   * event would carry nothing; the native setter fires input and change with the new value.
    * @param {string} selector
    * @param {string} value
    */
@@ -229,7 +284,7 @@ class DOMController {
     await this._page.waitForSelector(selector, { visible: true });
     await this._page.evaluate(
       (sel, val) => {
-        const el = /** @type {any} */ (document.querySelector(sel));
+        const el = /** @type {HTMLInputElement | HTMLTextAreaElement | null} */ (document.querySelector(sel));
         if (!el) throw new Error(`Element not found: ${sel}`);
         const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
         if (desc?.set) desc.set.call(el, val);
@@ -243,17 +298,15 @@ class DOMController {
   }
 
   /**
-   * Gets current value of an input or textarea element.
    * @param {string} selector
-   * @returns {Promise<string>}
+   * @returns {Promise<string | undefined>} undefined when the element has no value property
    */
   async getValue(selector) {
     await this._page.waitForSelector(selector);
-    return this._page.$eval(selector, (/** @type {any} */ el) => el.value);
+    return this._page.$eval(selector, (node) => /** @type {FormLikeElement} */ (node).value);
   }
 
   /**
-   * Gets trimmed text content of an element.
    * @param {string} selector
    * @returns {Promise<string>}
    */
@@ -263,7 +316,6 @@ class DOMController {
   }
 
   /**
-   * Gets attribute value of an element.
    * @param {string} selector
    * @param {string} attribute
    * @returns {Promise<string | null>}
@@ -274,7 +326,6 @@ class DOMController {
   }
 
   /**
-   * Gets outer HTML of element matching selector.
    * @param {string} selector
    * @returns {Promise<string>}
    */
@@ -284,7 +335,6 @@ class DOMController {
   }
 
   /**
-   * Gets full page HTML.
    * @returns {Promise<string>}
    */
   async getHtml() {
@@ -292,14 +342,14 @@ class DOMController {
   }
 
   /**
-   * Inspects detailed properties of an element (attributes, computed styles, visibility, rect).
    * @param {string} selector
    * @returns {Promise<object>}
    */
   async inspectElement(selector) {
     await this._page.waitForSelector(selector);
-    /** @type {Record<string, any>} */
-    const elementData = await this._page.$eval(selector, (/** @type {any} */ el) => {
+    /** @type {Record<string, unknown>} */
+    const elementData = await this._page.$eval(selector, (node) => {
+      const el = /** @type {FormLikeElement} */ (node);
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
 
@@ -354,12 +404,14 @@ class DOMController {
   }
 
   /**
-   * Audits registered DOM event listeners on an element, 'window', or 'document' via CDP DOMDebugger.
-   * Crucial for finding DOM XSS sinks, PostMessage handlers, and hidden action handlers.
    * @param {string} [target='window'] - CSS selector or 'window' or 'document'
-   * @returns {Promise<Array<object>>}
+   * @returns {Promise<Array<Pick<import('devtools-protocol').Protocol.DOMDebugger.EventListener, 'type' | 'useCapture' | 'passive' | 'once' | 'scriptId' | 'lineNumber' | 'columnNumber'> & { handlerDescription: string | null }>>}
    */
-  async getEventListeners(target = 'window') {
+  /**
+   * @param {string} [target] 'window', 'document', or a selector
+   * @param {{ pierce?: boolean }} [options] pierce also reports listeners inside iframes and shadow roots
+   */
+  async getEventListeners(target = 'window', options = {}) {
     if (!this._cdp) {
       throw new Error('CDPSession is required to audit event listeners via DOMDebugger');
     }
@@ -382,9 +434,11 @@ class DOMController {
       throw new Error(`Target not found for event listeners: ${target}`);
     }
 
+    // depth -1 covers the whole subtree under the object, so one call on the document lists every element's listeners
     const response = await this._cdp.send('DOMDebugger.getEventListeners', {
       objectId: result.objectId,
       depth: -1,
+      pierce: Boolean(options.pierce),
     });
 
     return (response.listeners || []).map((l) => ({
@@ -400,22 +454,23 @@ class DOMController {
   }
 
   /**
-   * Dumps all HTML forms, methods, actions, and their input fields.
-   * Essential for bug bounty parameter and endpoint discovery.
    * @returns {Promise<Array<object>>}
    */
   async dumpForms() {
     return this._page.evaluate(() => {
       return Array.from(document.forms).map((form, index) => {
-        const inputs = Array.from(form.elements).map((/** @type {any} */ el) => ({
-          name: el.name || '',
-          id: el.id || '',
-          tagName: el.tagName.toLowerCase(),
-          type: el.type || '',
-          value: el.value || '',
-          required: el.required || false,
-          disabled: el.disabled || false,
-        }));
+        const inputs = Array.from(form.elements, (node) => {
+          const el = /** @type {FormControlLike} */ (node);
+          return {
+            name: el.name || '',
+            id: el.id || '',
+            tagName: el.tagName.toLowerCase(),
+            type: el.type || '',
+            value: el.value || '',
+            required: el.required || false,
+            disabled: el.disabled || false,
+          };
+        });
 
         return {
           index,
@@ -431,8 +486,6 @@ class DOMController {
   }
 
   /**
-   * Dumps hidden inputs and elements styled with display:none / visibility:hidden.
-   * Frequently used to extract CSRF tokens, internal IDs, and hidden API flags.
    * @returns {Promise<Array<object>>}
    */
   async dumpHiddenInputs() {
@@ -440,7 +493,8 @@ class DOMController {
       /** @type {Array<Record<string, string | null>>} */
       const items = [];
 
-      document.querySelectorAll('input[type="hidden"]').forEach((/** @type {any} */ el) => {
+      document.querySelectorAll('input[type="hidden"]').forEach((node) => {
+        const el = /** @type {HTMLInputElement} */ (node);
         items.push({
           category: 'input[type="hidden"]',
           name: el.name || '',
@@ -467,7 +521,6 @@ class DOMController {
   }
 
   /**
-   * Dumps localStorage and sessionStorage contents.
    * @returns {Promise<{ localStorage: object, sessionStorage: object }>}
    */
   async dumpStorage() {
@@ -503,7 +556,7 @@ class DOMController {
    */
   async hookPostMessage() {
     await this._page.evaluateOnNewDocument(() => {
-      const w = /** @type {any} */ (window); // the hook keeps its state on window, which TypeScript does not know
+      const w = /** @type {HookedWindow} */ (/** @type {unknown} */ (window)); // the hook keeps its state on window, which TypeScript does not know
       if (w.__postMessageHookInstalled) return;
       w.__postMessageHookInstalled = true;
       w.__postMessageLogs = [];
@@ -512,19 +565,21 @@ class DOMController {
       const originalRemoveEventListener = window.removeEventListener;
       // Keep the wrapper addressable, otherwise the page's own removeEventListener('message', fn)
       // silently does nothing and the handler stays attached for the rest of the session.
+      /** @type {WeakMap<EventListenerOrEventListenerObject, EventListener>} */
       const wrappers = new WeakMap();
 
-      /** @this {Window} @param {string} type @param {any} listener @param {any} [options] */
+      /** @this {Window} @param {string} type @param {EventListenerOrEventListenerObject | null} listener @param {boolean | AddEventListenerOptions} [options] */
       window.addEventListener = function (type, listener, options) {
         if (type === 'message' && listener) {
           let wrappedListener = wrappers.get(listener);
           if (!wrappedListener) {
-            /** @this {any} @param {MessageEvent} event */
+            /** @this {unknown} @param {Event} event */
             wrappedListener = function (event) {
+              const message = /** @type {MessageEvent} */ (event);
               w.__postMessageLogs.push({
                 direction: 'received',
-                origin: event.origin,
-                data: event.data,
+                origin: message.origin,
+                data: message.data,
                 timestamp: Date.now(),
               });
               return typeof listener === 'function'
@@ -538,7 +593,7 @@ class DOMController {
         return Reflect.apply(originalAddEventListener, this, arguments);
       };
 
-      /** @this {Window} @param {string} type @param {any} listener @param {any} [options] */
+      /** @this {Window} @param {string} type @param {EventListenerOrEventListenerObject | null} listener @param {boolean | AddEventListenerOptions} [options] */
       window.removeEventListener = function (type, listener, options) {
         const wrappedListener = type === 'message' && listener ? wrappers.get(listener) : null;
         if (wrappedListener) {
@@ -548,7 +603,7 @@ class DOMController {
       };
 
       const originalPostMessage = window.postMessage;
-      /** @this {Window} @param {any} message @param {string} [targetOrigin] */
+      /** @this {Window} @param {unknown} message @param {string | WindowPostMessageOptions} [targetOrigin] */
       w.postMessage = function (message, targetOrigin) {
         w.__postMessageLogs.push({
           direction: 'sent',
@@ -562,15 +617,13 @@ class DOMController {
   }
 
   /**
-   * Retrieves recorded postMessage logs.
-   * @returns {Promise<Array<object>>}
+   * @returns {Promise<PostMessageLog[]>}
    */
   async getPostMessageLogs() {
-    return this._page.evaluate(() => /** @type {any} */ (window).__postMessageLogs || []);
+    return this._page.evaluate(() => /** @type {HookedWindow} */ (/** @type {unknown} */ (window)).__postMessageLogs || []);
   }
 
   /**
-   * Loads current page HTML into Cheerio for fast local DOM traversal.
    * @returns {Promise<import('cheerio').CheerioAPI>}
    */
   async toCheerio() {
@@ -579,7 +632,6 @@ class DOMController {
   }
 
   /**
-   * Extracts primary article content and converts it to GitHub Flavored Markdown.
    * @param {{ headingStyle?: 'setext' | 'atx', codeBlockStyle?: 'indented' | 'fenced' }} [options]
    * @returns {Promise<{ title: string, byline?: string, excerpt?: string, markdown: string, textContent: string } | null>}
    */

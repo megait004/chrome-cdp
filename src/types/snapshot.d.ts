@@ -15,6 +15,9 @@ export interface SnapshotElement {
 export interface InteractiveSnapshot {
   url: string;
   readyState: string;
+  /** Every interactive element in view-independent terms; `elements` holds at most the first 150. */
   count: number;
+  /** True when `count` is larger than `elements` because of the 150-element cap. */
+  truncated?: boolean;
   elements: SnapshotElement[];
 }

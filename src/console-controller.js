@@ -5,14 +5,9 @@ const matchesQuery = require('./match-query');
 
 /**
  * One console message or uncaught exception as this controller records it.
- * @typedef {{ type: string, text: string, args?: unknown[], stackTrace: Array<{ functionName: string, scriptId: string, url: string, lineNumber: number, columnNumber: number }>, executionContextId?: number, timestamp: number }} ConsoleEntry
+ * @typedef {{ type: string, text: string, args?: unknown[], stackTrace: Array<{ functionName: string, scriptId: string, url: string, lineNumber: number, columnNumber: number }>, executionContextId?: number, timestamp: number, scriptId?: string, url?: string, lineNumber?: number, columnNumber?: number }} ConsoleEntry
  */
 
-/**
- * Advanced Console and Runtime Controller for CDP.
- * Captures full V8 call stack traces, unhandled exceptions, RemoteObject inspection,
- * and heap object querying for reverse engineering.
- */
 class ConsoleController extends EventEmitter {
   /**
    * @param {import('puppeteer-core').Page} page
@@ -25,7 +20,6 @@ class ConsoleController extends EventEmitter {
 
     this._page = page;
     this._cdp = cdpSession;
-    /** @type {Array<object>} */
     /** @type {ConsoleEntry[]} */
     this._logs = [];
     this._isRecording = false;
@@ -35,7 +29,6 @@ class ConsoleController extends EventEmitter {
   }
 
   /**
-   * Starts listening to console events, call stacks, and runtime exceptions.
    * @returns {Promise<void>}
    */
   async startRecording() {
@@ -48,9 +41,6 @@ class ConsoleController extends EventEmitter {
     this._isRecording = true;
   }
 
-  /**
-   * Stops listening to console events.
-   */
   stopRecording() {
     if (!this._isRecording) return;
 
@@ -60,22 +50,18 @@ class ConsoleController extends EventEmitter {
     this._isRecording = false;
   }
 
-  /**
-   * Clears recorded console logs.
-   */
   clear() {
     /** @type {ConsoleEntry[]} */
     this._logs = [];
   }
 
   /**
-   * Returns recorded console messages with optional filters.
    * @param {{
    *   type?: string,
    *   query?: string | RegExp,
    *   hasStackTrace?: boolean
    * }} [filter]
-   * @returns {Array<object>}
+   * @returns {ConsoleEntry[]}
    */
   getLogs(filter = {}) {
     return this._logs.filter((item) => {
@@ -94,11 +80,11 @@ class ConsoleController extends EventEmitter {
   }
 
   /**
-   * Evaluates an expression or function in the page context via CDP Runtime.evaluate.
-   * Returns unwrapped result value.
-   * @param {string | ((...args: any[]) => any)} expressionOrFn
-   * @param {...any} args
-   * @returns {Promise<any>}
+   * @template {unknown[]} P
+   * @template R
+   * @param {string | ((...args: import('puppeteer-core').InnerParams<P>) => R)} expressionOrFn
+   * @param {P} args
+   * @returns {Promise<Awaited<R>>} For a string expression the value is whatever JSON the page produced; the caller states its type through R.
    */
   async evaluate(expressionOrFn, ...args) {
     if (typeof expressionOrFn === 'function') {
@@ -124,21 +110,19 @@ class ConsoleController extends EventEmitter {
       throw new Error(`Runtime.evaluate failed: ${desc}`);
     }
 
-    return response.result?.value;
+    return /** @type {Awaited<R>} */ (response.result?.value);
   }
 
   /**
-   * Inspects complex JavaScript objects, prototypes, symbols, and getters via CDP Runtime.getProperties.
-   * Eliminates cyclic reference and serialization errors.
+   * Inspects an object with Runtime.getProperties, so cyclic references and getters do not break serialization.
    * @param {string} objectIdOrExpression
    * @param {{ ownProperties?: boolean }} [options]
-   * @returns {Promise<Array<{ name: string, value: any, type: string, isGetter: boolean, isSetter: boolean }>>}
+   * @returns {Promise<Array<{ name: string, value: unknown, type: string, isGetter: boolean, isSetter: boolean, writable?: boolean, enumerable?: boolean, configurable?: boolean }>>}
    */
   async inspectObject(objectIdOrExpression, { ownProperties = true } = {}) {
     let targetObjectId = objectIdOrExpression;
     let releaseTarget = false;
 
-    // If it is an expression, evaluate it first without value serialization
     if (!/^-?\d+(\.\d+){2,}$/.test(objectIdOrExpression)) {
       const evalRes = await this._cdp.send('Runtime.evaluate', {
         expression: objectIdOrExpression,
@@ -203,12 +187,11 @@ class ConsoleController extends EventEmitter {
   }
 
   /**
-   * Queries all active instances of a class or prototype across the entire V8 heap.
-   * Exceptional tool for finding secret state, in-memory tokens, and active sessions.
    * @param {string} prototypeExpression - e.g. "UserSession.prototype" or "MyService.prototype"
-   * @returns {Promise<Array<any>>}
+   * @param {{ limit?: number }} [options] at most this many instances are returned (default 100). Common prototypes such as HTMLElement.prototype can match thousands of live objects, and dumping them all by value fails with "Internal error"
+   * @returns {Promise<unknown[]>}
    */
-  async queryObjects(prototypeExpression) {
+  async queryObjects(prototypeExpression, { limit = 100 } = {}) {
     const protoRes = await this._cdp.send('Runtime.evaluate', {
       expression: prototypeExpression,
       returnByValue: false,
@@ -229,16 +212,18 @@ class ConsoleController extends EventEmitter {
 
     const dumpRes = await this._cdp.send('Runtime.callFunctionOn', {
       objectId: queryRes.objects.objectId,
-      functionDeclaration: 'function() { return Array.from(this); }',
+      // note: DOM nodes serialize to {} through JSON, and cyclic objects throw; both fall back to String()
+      // so one bad instance cannot fail the whole query. Use dom.inspectElement for DOM nodes.
+      functionDeclaration: 'function(limit) { return Array.from(this).slice(0, limit).map((o) => { try { return JSON.parse(JSON.stringify(o)); } catch { return String(o); } }); }',
+      arguments: [{ value: limit }],
       returnByValue: true,
     });
 
     await this._cdp.send('Runtime.releaseObject', { objectId: queryRes.objects.objectId }).catch(() => {});
-    return dumpRes.result?.value || [];
+    return /** @type {unknown[]} */ (dumpRes.result?.value || []);
   }
 
   /**
-   * Internal handler for Runtime.consoleAPICalled.
    * @private
    */
   /** @param {import('devtools-protocol').Protocol.Runtime.ConsoleAPICalledEvent} event */
@@ -270,7 +255,6 @@ class ConsoleController extends EventEmitter {
   }
 
   /**
-   * Internal handler for Runtime.exceptionThrown.
    * @private
    */
   /** @param {import('devtools-protocol').Protocol.Runtime.ExceptionThrownEvent} event */

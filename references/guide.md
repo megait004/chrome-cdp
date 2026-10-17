@@ -1,355 +1,242 @@
-# Chrome CDP — guide
+# Chrome CDP guide
 
-Long-form how-to for `SKILL.md`. Read the section you need; every command and method is in `api.md`.
+Short how-to for `SKILL.md`. Every command and method is in `api.md`.
 
-## The one thing to understand first
+## Contents
 
-One Chrome process listens on port 9222. `connect()` attaches to it, takes over an existing tab, and **immediately starts recording** network, WebSocket, console, and parsed scripts.
+- [Order of events](#order-of-events)
+- [CLI or script](#cli-or-script)
+- [Interaction loop](#interaction-loop)
+- [Timing](#timing)
+- [Response bodies](#response-bodies)
+- [Workflows](#workflows)
+- [Reporting](#reporting)
+- [Command details](#command-details)
 
-That ordering is the whole game:
+## Order of events
 
-```text
-connect()   <- recording starts here
-  goto()    <- everything from this load is captured
-  wait      <- late XHR / WS frames land here
-  read      <- getTraffic(), getFrames(), getScripts()
-```
+One Chrome listens on port 9222. `connect()` attaches and **starts recording** immediately. Anything before the attach is invisible, so do not navigate first and connect second.
 
-Anything that happened before `connect()` is invisible. If you navigate first and connect second, you get nothing and it looks like a bug.
+## CLI or script
 
----
-
-## CLI or script?
-
-This is the decision that determines whether the task takes 20 seconds or 5 minutes of confused reloading.
-
-Every `cli.js` command attaches to the live tab, does its one thing, and **leaves the tab open** — only `close` (or you, by hand) closes one. A command navigates only when you pass it a URL; omit the URL and it reads the page as it currently is, with the login, the SPA route, and the WebSocket session the user has built up. That makes a sequence of CLI commands behave like one session: log in once, then read from it indefinitely.
-
-**Use the CLI** for anything that is a read or a bounded capture:
+Use the CLI for reads and bounded captures. Every command attaches to the live tab, does one thing, and leaves the tab open. A command navigates only when you pass a URL.
 
 ```bash
-node cli.js dump-forms https://target.com/login          # navigate + audit
-node cli.js traffic https://target.com --bodies --out .tmp/traffic.json
-node cli.js search-sources https://target.com "api_key"
-node cli.js traffic --wait 10 --bodies --out .tmp/live.json   # attach to the live tab,
-                                                              # record 10s while the user interacts
+node cli.js traffic https://target.com --bodies --out .tmp/traffic.json   # load + capture HTTP and WebSocket
+node cli.js traffic --wait 10 --bodies --out .tmp/live.json               # live tab, 10 s while you interact
+node cli.js search-sources "api_key"                                      # substring; add --re for regex
+node cli.js eval "({href: location.href, links: document.links.length})"
 ```
 
-Full command list: `node cli.js --help`.
+Write a script only for control flow the CLI cannot express: waits on a WebSocket frame while sending, breakpoints with `evaluateOnCallFrame`, or bulk processing of a large capture. Then `require('../index')` from a file in `.tmp/`, and `disconnect()` in a `finally`.
 
-Three flags that save a whole script:
+Two mistakes that cost time on every investigation of the skill itself:
 
-- `traffic --bodies --out .tmp/traffic.json` — with a URL: waits for network idle, captures HTTP requests **and WebSocket frames** (`--wait S` dwells longer for late frames), drains every response body into the artifact (marked `(...)` where Chrome keeps none), writes it to a file, prints only the path. The default first move against any new target: one command, everything on disk, nothing to write. Without a URL: attaches to the current tab and records while the user interacts — the way to read a WebSocket session without disturbing it. WebSocket caveat: sockets opened before the attach show with `url: ''` (handshake missed) — their frames still flow and are searchable; run `traffic <url>` instead when the handshake matters.
-- `eval [url] <expr>` — with a URL it navigates first; without one it evaluates on the current tab. Chain evals to poke at state built up by earlier commands — `eval "({href: location.href, links: document.links.length})"`.
-- `search-sources [url] <query> --re` — regex search from the CLI. A plain query is a case-insensitive substring, which is usually enough; use `--re` when you need alternation (`websocket|wss:`). Note a leading `/` in an argument gets path-mangled by Git Bash, so regex is a flag rather than a `/.../` literal.
+- **`require` counts directory levels.** A script at `.tmp/x.js` needs `require('../index')`; one in a subdirectory, `.tmp/gecko/x.js`, needs `require('../../index')`. Getting it wrong is a `MODULE_NOT_FOUND` that reads like the skill is broken.
+- **PowerShell does not expand globs for a native command.** `rg -n "pattern" src/*.js` fails with `The filename, directory name, or volume label syntax is incorrect`; that is the shell, not ripgrep. Use `rg -n "pattern" -g "*.js" .`, or `rg -n "pattern" src` (ripgrep recurses), or `fd -e js . src`.
 
-Because every command accepts the URL as optional, a chain needs at most one navigation: `traffic <url>` loads the page, then `dump-forms`, `search-sources <query>`, `eval <expr>` all read that same live tab. Every one of them accepts a **query** for `queryOrId`, so you never need to carry a `scriptId` across commands either.
+Before you open the page, list every question you want answered. One session answers them all. Each extra navigation re-records traffic and invalidates the `scriptId`s you hold.
 
-**Write a script** only when the flow itself needs control flow — branching, loops, or event-driven waits that one command at a time cannot express:
+## Interaction loop
 
-- *Event-driven waits.* You need `waitForEvent` on WebSocket frames while sending, or `setBreakpoint` + `evaluateOnCallFrame`.
-- *Bulk processing.* Filtering, aggregating, or diffing large captures in one pass.
-- *Non-interactive environments.* When nobody is at the browser to close dialogs.
-
-Everything else — including page interaction — is CLI now. Long interaction scripts are how agents end up debugging their own code instead of looking at the page: the script assumed a DOM that was never there, failed, and the failure got attributed to the code rather than the assumption. Do it the human way instead:
-
-Before you open the page at all, write down every question you want answered — including the follow-ups you can already see coming, and the edge cases you would otherwise go back for. One session can answer all of them; each extra navigation re-records traffic you already had and invalidates the `scriptId`s you were holding. The expensive mistake is not writing a script that turns out too big, it is discovering question six after you closed the page.
-
-### Canvas games and iframes — snapshot first, no screenshots
-
-`snapshot` lists the page's interactive elements **and** each iframe's URL, canvases (index, size) and elements. That is the view to read every time; the agent does not need pixels for it.
+Look, act, look. Each step is one command, and its output says what changed:
 
 ```bash
-node cli.js snapshot https://target.com/game        # frames[]: url, canvases[], elements[]
-node cli.js click-at 160 80 --frame game.html        # click inside the iframe, frame-relative
-node cli.js key KeyW --hold 300 --frame game.html    # hold a key (click the game first to focus it)
-node cli.js eval "document.title"                   # read state the game exposes to the page
+node cli.js snapshot https://target.com/login     # LOOK: visible interactive elements
+node cli.js type "#login_field" "user@example.com" # ACT: real per-key events
+node cli.js fill "#password" "hunter2"            # ACT: native setter, fires input and change
+node cli.js click "text=Sign in"                  # ACT: match by visible text
+node cli.js wait "#dashboard" --timeout 10        # LOOK: did the expected thing appear?
 ```
 
-Canvas pixels are the last resort: `canvas --frame U --out file.png` writes them, and only when the snapshot and the page state cannot answer the question. Text painted on a canvas is invisible to `snapshot`.
+- **Snapshot before every action.** Pick selectors from the current page, never from memory or an older snapshot.
+- **A failed click lists the elements that exist now.** Pick a real selector from that list.
+- **Ambiguous text hits the first match.** Scope the click to the panel that owns the input, or verify with an `eval` that reads the app's own state.
+- **Focus can be stolen.** When the window is hidden, `type` and `press` revive it and take foreground focus. `type` and `fill` report `valueMismatch` when the field does not hold what you typed. Then clear the field (`fill <sel> ""`) and retype, and tell the user you took their focus.
 
-### Act like a human — the interaction loop
+## Timing
 
-A person looks, acts, and sees the result immediately. The CLI's interaction commands are built for exactly that loop, one step per command, each with the DOM delta in its output:
+`goto()` resolves at `domcontentloaded`, so right after it you have only the first requests. Empty `getFrames()` or a short `getTraffic()` usually means you read too early.
 
-```bash
-node cli.js snapshot https://target.com/login        # LOOK: interactive elements, visible ones only
-node cli.js type "#login_field" "user@example.com"   # ACT: keystrokes, real per-key events
-node cli.js fill "#password" "hunter2"               # ACT: set value via native setter (React-safe), fires input+change
-node cli.js click "text=Sign in"                     # ACT: match by visible text
-node cli.js wait "#dashboard" --timeout 10           # LOOK: did the expected thing appear?
-```
-
-Three properties that keep this loop honest:
-
-- **Every action returns what changed** — `urlChanged` (full navigation), `added`/`removedCount` (SPA mutations), `readyState`. The click's output IS the observation; you never have to guess whether anything happened.
-- **Every failure points back at the DOM.** A failed `click` lists the interactive elements that exist right now — the fix is to pick a real selector from that list, not to debug the command. An element that was there five commands ago is irrelevant; only the current DOM counts.
-- **`snapshot` before acting, always.** Pick selectors from what the page shows now — never from a previous snapshot, never from memory of a similar site. `text=Label` matches by visible text like a person reads a button, and `click [url] <target>` navigates first when a URL is given.
-- **Ambiguous text matches hit the wrong twin.** A page with several "Connect" buttons connects whichever the DOM puts first. Scope it: find the input, walk up to its panel (`eval` is fine for this), and click within that scope — or verify the action landed with an `eval` reading the app's own state (e.g. its connection log), not just the DOM's presence.
-- **You are on a real desktop — the revive steals focus.** When the Chrome window is occluded (`visibilityState: 'hidden'`), Chromium drops synthesized keyboard input entirely; `type`/`press` revive the window (minimized→normal dance) and it takes foreground focus. `type` verifies itself and falls back to `Input.insertText` when the keys did not land, and `type`/`fill` echo `valueAfter` with `valueMismatch: true` when the field does not hold what was typed — human keystrokes can land beside yours. On mismatch: don't retry blind; clear the field (`fill <sel> ""`) and retype, and tell the user you took their focus.
-
-This replaces the long interaction script for the common case: act one step at a time, re-read the DOM between steps, and let each step's own output tell you what to do next.
-
-### Running a script
-
-`require('../index')` resolves relative to the script file, so scratch scripts live **inside the skill directory**. Put them in `.tmp/` — that path is already gitignored — and delete them when done.
+Wait for the signal you care about:
 
 ```javascript
-// .tmp/probe.js
-const { connect } = require('../index');
+const { waitForEvent, waitUntil, assertEventually } = require('../index');
 
-(async () => {
-  const client = await connect({ port: 9222 });
-  try {
-    await client.goto('https://target.com');
-    console.log(await client.title());
-  } finally {
-    await client.closePage();
-    await client.disconnect();
-  }
-})();
-```
-
-```bash
-node .tmp/probe.js
-```
-
-Always `disconnect()` in a `finally`. Add `closePage()` too when the script is a throwaway probe — otherwise leave the tab open so the user can keep interacting with it; the next run attaches to the same live page and inherits its state (logins, SPA routes, WebSocket sessions). Clean up with `closePage()` or `node cli.js close` only when the tab is done serving.
-
----
-
-## Timing: the trap that produces empty results
-
-`goto()` defaults to `waitUntil: 'domcontentloaded'` with a 15s timeout, and deliberately swallows the timeout if the DOM already parsed. This keeps SPAs, games, and streaming sites from failing outright — but it means **`goto()` usually resolves while the page is still fetching.**
-
-So reading immediately after `goto()` gives you the first few requests and nothing else. Empty `getFrames()` and half-empty `getTraffic()` almost always mean "read too early", not "nothing there".
-
-Wait for the signal you actually care about — not for a number of seconds you guessed. Three primitives, and the choice between them is the whole point:
-
-```javascript
-const { connect, waitForEvent, waitUntil, assertEventually } = require('../index');
-```
-
-**Listen when you can.** The controllers emit `frame` / `frameSent` / `frameReceived` / `socketCreated` / `request` / `response`, so you can return on the event itself rather than on the next poll tick. Listening never lags behind the data and never misses a value that appeared and was replaced between two samples:
-
-```javascript
-const trades = await waitForEvent(client.websocket, 'frame', {
-  count: 10,
-  timeout: 30000,
-  where: (f) => f.direction === 'received',
+// Listen when the controller emits the event: returns on the event itself
+const frames = await waitForEvent(client.websocket, 'frame', {
+  count: 10, timeout: 30000, where: (f) => f.direction === 'received',
 });
-```
 
-**Poll when there is no event** — a bundle parsed, the network going quiet, a DOM node appearing:
-
-```javascript
-await client.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+// Poll when there is no event
 const bundle = await waitUntil(() => client.sources.getScripts({ url: /app\./ }));
-```
 
-**Say which one you mean.** `waitUntil` and `assertEventually` run the same loop; the names carry the intent, and that distinction is load-bearing. `waitUntil` *synchronizes* — on timeout it hands back whatever it saw, because seven captured frames are still seven frames. `assertEventually` *claims* — on timeout it throws with a diagnostic, because a claim that quietly returns an empty array is exactly how "the site sends no heartbeat" gets written about something that was never actually waited for:
-
-```javascript
-// I need this to be true before the next line means anything
+// Claim that something happens: throws on timeout
 await assertEventually(() => client.websocket.getSockets({ state: 'open' }), {
-  describe: 'the market-data socket to open',
+  describe: 'the socket to open',
 });
-
-// I will take whatever arrived and report the real count
-const frames = await waitUntil(() => client.websocket.getFrames(id), { min: 10, timeout: 30000 });
-console.log(`captured ${frames.length} frames`);
 ```
 
-Options: `{ timeout = 20000, every = 300, min = 1 }`. `min` is how you say "wait for enough frames to see the pattern" rather than "wait 30 seconds and hope".
+- `waitUntil` **synchronizes**: on timeout it returns what it saw. Use it when a partial result is still useful.
+- `assertEventually` **claims**: on timeout it throws. Use it when the next line is only valid if the condition held.
+- Options: `{ timeout = 20000, every = 300, min = 1 }`.
 
-### Proving a negative
+**Proving a negative** ("the server never sends X") needs a window, not a sleep. Wait for a marker you know the page produces after the event would have happened, then report the window: "no PING in 76 s across 630 frames", not "the server sends no PING". A fixed sleep dressed as a condition is still a sleep.
 
-"The server never sends a PING" is a much harder claim than it looks, and the tempting move — sleep 70 seconds, see nothing, conclude nothing is there — is wrong twice over. It makes every run slow even when it succeeds, and it cannot distinguish "the site does not do this" from "the site had not gotten around to it yet".
+`hookPostMessage()` only affects loads that happen after it. Call it before `goto()`.
 
-Do not dress a fixed sleep up as a condition either. `waitUntil(() => frames.length >= 100000, { timeout: 70000 })` on a page that produces 700 frames is a 70-second sleep wearing a costume — worse than an honest `setTimeout`, because the next reader thinks a real condition was checked.
+## Response bodies
 
-Instead, wait for a **marker**: something you know the page does, that completes *after* the thing you are checking for would have happened. Then the absence is bounded by an event rather than by a guess:
+Request metadata lives in the library's memory and survives the session. Response bodies live in Chrome's buffer. Chrome evicts them under pressure and clears them on navigation. `startRecording()` configures durable storage (100 MB total, 5 MB per resource), so bodies normally survive navigation.
 
-```javascript
-// Ten kline frames is roughly a minute of traffic — if a PING were coming, it came.
-await waitUntil(() => client.websocket.getFrames(id, { direction: 'received' }), { min: 10 });
-
-const control = client.websocket.getFrames(id).filter((f) => f.opcode === 9 || f.opcode === 10);
-// Now the claim has a shape: not "there is no ping" but "no ping in this window".
-console.log(`no control frames across ${frames.length} frames / ${windowSeconds}s`);
-```
-
-Report the window along with the absence. "No PING observed in 76s across 630 frames" is a fact a reader can act on; "the server sends no PING" is a guess that will strand whoever writes a client against it.
-
-For WebSockets specifically, frames arrive *after* the handshake and often only in response to user action — connect, navigate, interact, **then** wait, then read.
-
-`hookPostMessage()` has the opposite constraint: it installs via `evaluateOnNewDocument`, so it only affects loads that happen after it. **Call it before `goto()`.**
-
----
-
-## Reading too late: response bodies used to expire
-
-The timing trap has a mirror image. Everything this library records — URLs, headers, status, timings, WebSocket frames — lives in its own memory and survives the whole session. Response bodies are different: they stay in Chrome's network buffer, which Chrome evicts under memory pressure and clears on navigation.
-
-**Since this build, `startRecording()` also calls `Network.configureDurableMessages`** — bodies are stored outside the renderer (100 MB total, 5 MB per resource), so `getResponseBody()` keeps working across navigations. Bodies fetched before a navigation are expected to stay readable after it; this was not re-verified after the e2e suite was removed. Two caveats an honest report must carry:
-
-- It is bounded, not infinite — past the buffer the oldest bodies go first, so a session that streams gigabytes can still lose early ones.
-- On older Chrome builds the call is rejected and silently ignored — bodies there behave the old way. When a body comes back empty, say so in that row rather than leaving a `null` for a reader to misread as an empty response.
-
-Drain bodies as you capture them anyway — it is cheap insurance and it is the only way to be sure a row's `body` was never truncated:
+- Durable storage is bounded: the oldest bodies go first in a long session.
+- On an older Chrome build the call is ignored. An empty body there means "not stored", not "empty response". Say so in the report.
+- Pull each body while its request is fresh:
 
 ```javascript
 const captured = [];
 for (const request of await waitUntil(() => client.network.getTraffic({ resourceType: 'XHR' }), { min: 5 })) {
-  const body = await client.network.getResponseBody(request.id).catch(() => null);
-  captured.push({ url: request.url, status: request.status, body });
+  captured.push({ url: request.url, status: request.status,
+    body: await client.network.getResponseBody(request.id).catch(() => null) });
 }
 ```
 
-The failure is quiet and it lands late. You scroll a page twenty times, collect thirty requests, then loop over them at the end and find the first few have bodies and the rest return an error string — by which time the page state that produced them is gone. Pull each body while its request is fresh.
-
-Two related habits worth the same discipline:
-
-- **Stop driving the page once it tells you it is done.** A `has_next: false`, a spinner that disappears, an empty result array — that is the site's own stop condition. Firing ten more scroll events past it produces phantom requests that you then have to explain, or worse, silently report as real.
-- **Check what your capture actually holds before you write about it.** One pass over the saved artifact answers it: `captured.filter((c) => !c.body).length` is the number you owe the reader.
-
----
+- Stop driving the page when it reports it is done (`has_next: false`, an empty result). More events after that create requests you then have to explain.
 
 ## Workflows
 
-### Replay a request in Burp
+The workflow scripts (replay a request, WebSocket protocol, bundles, mirror a site, pause and step) are in [workflows.md](workflows.md).
 
-Raw, unnormalized headers including the HTTP/2 pseudo-headers (`:method`, `:path`, `:authority`) plus the raw body, formatted as RFC 7230 text.
+## Reporting
 
-```javascript
-const posts = client.network.getTraffic({ method: 'POST' });
-console.log(await client.network.toRawRequest(posts[0].id));
-console.log(await client.network.toRawResponse(posts[0].id));
-
-// Or skip Burp entirely — replay the XHR identical to the original,
-// in-page; the replay is recorded like any other request.
-await client.network.replayXHR(posts[0].id);
-
-// Where does this token appear? URL, headers, and bodies all at once.
-client.network.searchTraffic(/bearer|auth_token|signature/i);
-// Response bodies specifically (native search, durable-store fallback):
-await client.network.searchBodies('api_key=');
-```
-
-### Inspect a WebSocket protocol
-
-```javascript
-const [socket] = await assertEventually(() => client.websocket.getSockets({ state: 'open' }), {
-  describe: 'a WebSocket to open',
-});
-
-// Frames trickle in. Wait for a handful so you see the shape, not just the handshake.
-await waitUntil(() => client.websocket.getFrames(socket.requestId), { min: 10, timeout: 30000 });
-
-const sent = client.websocket.getFrames(socket.requestId, { direction: 'sent', jsonOnly: true });
-
-// Or search every frame on every connection at once
-client.websocket.searchFrames('challenge_token')
-  .forEach(({ url, frame }) => console.log(`[${frame.direction}] ${url}:`, frame.payloadData));
-```
-
-### Map the attack surface of a page
-
-```javascript
-const forms = await client.dom.dumpForms();            // actions, methods, CSRF tokens
-const hidden = await client.dom.dumpHiddenInputs();    // type=hidden + CSS-hidden
-const storage = await client.dom.dumpStorage();        // localStorage + sessionStorage
-const cookies = await client.network.getCookies();
-
-// Trace a handler back to the exact file and line that registered it
-const [handler] = await client.dom.getEventListeners('#checkout-btn');
-console.log(handler.scriptId, handler.lineNumber, handler.columnNumber);
-
-// postMessage: hook BEFORE navigating, read after
-await client.dom.hookPostMessage();
-await client.goto(url);
-console.log(await client.dom.getPostMessageLogs());
-```
-
-### Reverse a bundle
-
-The natural order is search → narrow → transform. `searchInSources` runs inside Chrome's own debugger index, so it is fast even across huge bundles.
-
-```javascript
-const hits = await client.sources.searchInSources(/jwt_secret|X-Signature|api_endpoint/i);
-const { scriptId } = hits[0];
-
-const clean = await client.sources.deobfuscateBundle(scriptId);   // webcrack: unminify + undo obfuscator.io
-await client.sources.unpackBundle(scriptId, './.tmp/modules/');   // split webpack/browserify into files
-await client.sources.downloadBundle(scriptId, './.tmp/app.js');   // raw, as served
-
-// Structural search beats regex once you know the shape you want
-const calls = await client.sources.searchAst(scriptId, 'fetch($URL, { $$$OPTS })');
-calls.forEach((c) => console.log(c.metaMatches.URL));
-```
-
-If the bundle is obfuscated, deobfuscate first and search the *clean* code — names that were mangled become greppable again.
-
-### Read live memory
-
-```javascript
-await client.console.queryObjects('UserSession.prototype');  // every live instance of a class
-await client.console.inspectObject('window.AppConfig');      // deep props, no JSON serialization errors
-client.console.getLogs({ type: 'error', hasStackTrace: true });
-```
-
-### Pause and step
-
-```javascript
-await client.debug.enable({ pauseOnExceptions: true });
-await client.debug.setBreakpoint('https://target.com/app.js', 120);
-client.debug.on('paused', ({ callFrames, reason }) => console.log(reason, callFrames));
-await client.debug.resume();
-```
-
-Breakpoints are how you catch a value that only exists for one tick — a signature computed just before it is sent. Set one on the line `searchInSources` found, then read it out with `evaluateOnCallFrame`.
-
-### Extract content
-
-```javascript
-const { markdown } = await client.toMarkdown();   // Readability + GFM, strips nav/ads — returns { title, byline, excerpt, markdown, textContent }
-const $ = await client.toCheerio();               // jQuery-style traversal over the rendered DOM
-```
-
-Or one-shot: `node cli.js markdown <url> out.md`
-
----
-
-## Reporting findings
-
-An investigation is worth what its evidence is worth. Structure the answer so a reader can verify every claim without rerunning anything:
+Structure the answer so a reader can verify it without rerunning anything:
 
 ```text
-## Target
-<url>, and what state the page was in (logged in? which route?)
-
-## Findings
-For each: what it is, where it lives (file:line, request id, frame direction),
-and the raw evidence — the actual header, the actual frame, the actual source line.
-
-## How to reproduce
-The exact commands or script that produced the above.
-
-## Not covered
-What you did not look at, so nobody mistakes silence for a clean bill of health.
+## Target        url, and the state the page was in (logged in? which route?)
+## Findings      each claim, with where it lives and the raw evidence (header, frame, source line)
+## Reproduce     the exact commands or script
+## Not covered   what you did not look at
 ```
 
-Quote real bytes rather than paraphrasing them, and say "not observed" rather than "not present" — a live page only shows you what it happened to do while you were watching.
+- Quote real bytes. Say "not observed", not "not present": a live page shows only what it did while you watched.
+- **Re-derive every number from the artifact as you write.** Counts drift in your head. Read them back from the saved file. If you did not save an artifact, say what you observed instead.
 
-**Every number in the report gets re-derived from the artifact as you write it.** Not recalled from the run, not carried over from a console line you scrolled past an hour ago — read it back out of the file:
+## Render pipeline
 
-```javascript
-const calls = JSON.parse(fs.readFileSync('./.tmp/api-calls.json', 'utf8'));
-console.log(calls.length, 'requests captured, pages', calls.map((c) => c.page).join(','));
+Source: Chromium's Blink `core/` (`third_party/blink/renderer/core/` in the chromium/chromium repository). That tree is not part of this skill. To read it, clone sparsely (the repository is large):
+
+```bash
+git clone --filter=blob:none --no-checkout --depth 1 https://github.com/chromium/chromium.git references/chromium
+git -C references/chromium sparse-checkout set third_party/blink/renderer/core/<dir> third_party/blink/renderer/core/<dir2>
+git -C references/chromium checkout
 ```
 
-This sounds pedantic until you notice how the mistake happens. Counts drift while you work — you capture three pages, reason about ten, and write "10 pages" because that is the number you had in your head. The quoted bytes stay correct, so nothing looks wrong, and the one claim a reader can cheaply check against your own attached file is the one that is false. That is worse than a gap: it makes the reader distrust the evidence that *was* right.
+- **Order per frame:** style, layout, compositing inputs, pre-paint, paint (`dom/document_lifecycle.h`, `frame/local_frame_view.cc` `UpdateLifecyclePhasesInternal`). Layout can run again inside the same frame when a step after layout dirties it again (the loop in that function).
+- **Reading layout forces it.** `offsetWidth` and the other geometry getters call `UpdateStyleAndLayoutForNode` synchronously (`dom/element.cc`, `OffsetWidth`). A write followed by a read in one task costs a full style and layout each time.
+- **`display: none` has no layout object**; `visibility: hidden` and `opacity: 0` do (`dom/element.cc`, `LayoutObjectIsNeeded`).
+- **A plain `transform` or `opacity` change does not get a compositor layer.** Only an active animation or `will-change` does (`paint/compositing/compositing_reason_finder.cc`). Without one, the change repaints.
+- **Parser waits for stylesheets.** A stylesheet in the body does not block paint, but the parser pauses while a parser-blocking stylesheet is pending (`html/parser/html_document_parser.cc`, `WaitingForStylesheets`).
+- **`async` is immediate by default.** Blink has an intervention, `DelayAsyncScriptExecution`, which is `FEATURE_DISABLED_BY_DEFAULT` (`blink/common/features.cc`). Only an enabled feature or field trial can delay an `async` script (`script/script_loader.cc`).
+- **Paint is not caused by script.** A paint after a `requestAnimationFrame` callback runs in the frame, after the script returned. `layout` reports it as `(no script on stack)`: match it to the script by time, not by stack.
 
-So when you write "N frames", "M symbols", "K bytes", a status code, or a depth, the artifact is the source of truth. If you did not save an artifact for it, you do not have the number — say what you observed instead ("the capture stopped at page 3, so later pages are unverified"). An honest bound beats a confident invention every time.
+## Mapping what runs
 
----
+A way to get from a user event to the code that runs, without reading the whole bundle. Each step names the next one.
+
+1. `node cli.js events` lists the handlers: event type, and the `script:line:col` that registered it. Handlers registered by code that is only in the minified bundle show up here too, by their obfuscated event name.
+2. Start the interaction that matters, then `node cli.js profile --wait S` while you do it. The profile lists the functions that ran in that window, with self time and callers.
+3. Find the handler's code: `node cli.js vm-scripts` to name the script, `node cli.js find-function <scriptId> <name>` for a named function, `node cli.js deobfuscate <scriptId> <file>` for readable text.
+
+What this can and cannot show:
+
+- `events` is a snapshot at the moment it runs. A listener added after it is missing. Run it again after the page changes.
+- `events` cannot list events the page never registers, and it cannot trigger them. Testing an event means performing the action yourself.
+- `profile` is sampled every 1 ms. Totals are estimates: on a test loop of 1500 ms it reported 902 ms of self time. Treat the numbers as a ranking, not an exact time.
+- Callers are the immediate caller only. A deeper chain needs the trace stack (`layout` records one for style and layout).
+
+## Reverse-engineering a runtime payload
+
+The hard case: a production bundle that arrives as one file, gets decoded, and is then executed as a script the
+page created at runtime. The executed script has **no URL**, so searching by URL finds nothing, and its code is
+built from a string table, so reading it statically tells you the shape but not the run.
+
+Index through the artifacts: you know the input (the downloaded file) and the output (the decoded script), and the
+live work is the middle.
+
+1. `node cli.js vm-scripts` names every script with no URL: scriptId, line count, first 100 characters. The decoded
+   payload is normally the largest by far.
+2. `node cli.js catch-script <url> --min-bytes 2000000` pauses **before** that payload runs and prints the stack.
+   Frame 0 is the payload; frame 1 is the function that built it; `callerExcerpt` is the code at the call site —
+   the `new Function(...)` (or equivalent) call with its arguments. That is the decode entry, live.
+
+   Size alone may not be enough to name the target: a page can also have a large *inline* block that runs first, and
+   that block wins `--min-bytes`. Narrow with `--only-runtime` (scripts with no URL) and `--max-bytes`. A common
+   shape is a decoder module shipped as one huge string inside the HTML, which then builds the payload in memory:
+   the module is a runtime script of a few hundred kilobytes to a few megabytes, while the inline block is excluded
+   by `--only-runtime`. Passing a `--break-line` outside the script's range is rejected with that range.
+
+   Two traps around the bounds and the position arguments:
+   - The size bounds count **UTF-16 code units**, not bytes. `getScriptSource().length`, the `length` in
+     `vm-scripts` and the bounds all use the same unit, so a window never mis-targets a script; but comparing that
+     window against a file written by `download-bundle` does not hold, because the file is UTF-8 and its size grows
+     with every non-ASCII identifier in the script.
+   - A position's **line is the document's** for an inline `<script>` block and the script's own otherwise. A 1-line
+     inline block at document line N resolves at `--break-line N` (with `--break-col` left to default to the
+     script's start column), and `--break-line 0` fails with "Could not resolve breakpoint". Runtime scripts, the
+     usual target, start at line 0 and are unaffected.
+3. Same call with `--break-line 0`: the command then breaks inside the payload and prints `locals` (the payload's own
+   frame), `callerLocals` (the decoder's variables — the tables and native constructors it was handed) and
+   `evaluated` for `--eval <expr>`. Add `--frame 1` to evaluate in the decoder's frame instead of the payload's.
+   `find-function <id> <name>` gives a function's line **and column**, and `snippet <id> <line> --col N` prints the
+   characters around that position (`>>>` marks the column). A minified script is one line of a million characters, so
+   a window is the only way to read a position: those two commands replace the off-by-hand helper scripts otherwise
+   needed to hunt an offset.
+4. For a later hang or branch, `node cli.js break <scriptId> <line> --col N --trigger "<js>" --eval <expr>` breaks
+   inside the same payload again, at a line you chose.
+
+Two traps:
+
+- **The pause before a script runs cannot read values.** At an instrumentation pause, `evaluateOnCallFrame`,
+  `Runtime.getProperties` and `Runtime.evaluate` time out — the renderer's JS thread does not answer them — while
+  `Debugger.getScriptSource` answers in tens of milliseconds. Script sources and frame positions come back; variables
+  do not. `catch-script` prints that as a `note` when `--break-line` is missing. Read values at a breakpoint pause.
+- **A breakpoint is per position.** At a breakpoint pause the JS thread answers normally: `--eval` and scopes work.
+  But a line whose statement already ran will not hit again, so pick a line that runs later (or re-trigger it in the
+  same command with `--trigger`). A URL breakpoint cannot name a script with no URL: pass the scriptId.
+
+Primitives behind it, for scripts of your own: `client.debug.setInstrumentationBreakpoint('beforeScriptExecution')`,
+`setBreakpointAtLocation(scriptId, line, column, condition)`, `getScopeValues(callFrame, { limit })`,
+`evaluateOnCallFrame(callFrameId, expression)`. The pause state lives and dies with one CDP session, so a multi-step
+walk has to run inside a single script under `.tmp/`.
+
+One trap from doing that: with the breakpoint armed, `await client.cdp.send('Page.navigate', ...)` can time out, because
+the paused renderer holds the response back. Fire the navigation without awaiting it and let the pause loop drive.
+`catch-script` avoids this: it arms first, then sends `Page.navigate` and reads only its reply for the error text,
+never waiting for a load event.
+
+When `catch-script` cannot name the script you want — its size filter has no way to single it out, or you need a
+breakpoint armed *before* a particular module is created — write one `.tmp/` script that does the whole walk in a
+single session: `debug.enable()`, `sources.enable()`, `setInstrumentationBreakpoint('beforeScriptExecution')`,
+resume-through-pauses until your predicate matches, then `setBreakpointAtLocation(scriptId, line, column)`,
+`resume()`, wait for the hit, and read `getScopeValues` / `evaluateOnCallFrame`. That path is why the primitives are
+public: a breakpoint is only valid while the session that armed it is alive, and arming after the decode already ran
+will never hit (`break 1846 2 --col 847987` reported `hit: false` for exactly that reason).
+
+## Command details
+
+- **`mirror stop`** waits for 1.5 s of network quiet (max 10 s more). Do not sleep before it. It prints `Navigation failed:` when the page never loaded: read that line before trusting the output.
+- **`mirror start`** clears a stale `ACTIVE` pointer. A live recording blocks a new one: `mirror stop` first.
+- **`frames`** lists child iframes only. Canvases in the top document are not in its output: count them with `eval "document.querySelectorAll('canvas').length"`.
+- **`traffic`** without `--bodies` stores no response bodies. A missing body field means "not captured", not "empty". Add `--bodies`, or use `mirror start`, when you need the bytes.
+- **A search with zero hits is not proof of absence.** Try the other spelling of the text and the cleaned copy before you report it missing (see [workflows.md](workflows.md#script-with-no-url)).
+- **`wait <sel>`** needs a visible element. The error says `No element matches` or `exists but is not visible`. `--json` prints `{ok, reason, waitedSeconds, state, interactive}`.
+- **`break <query>`** lives only inside its command. Arm and trigger in one call: `break lazy.js 0 --trigger "<js>"`. A query matching no loaded script gives `hit: false`.
+- **`listeners` and `eval`** take a URL only when the first argument starts with `http(s)://`.
+- **`waitUntil`** does not throw on timeout. Use `assertEventually` when a timeout must fail.
+- **`dump-storage <url>`** navigates first, which also re-sets cookies that URL sets. Omit the URL to read the tab as it is.
+- **`traffic --json`** top-level keys: `finalUrl`, `mode`, `httpTraffic`, `wsSockets`. `traffic --headers` prints each repeated `Set-Cookie` on its own line.
+- **`--out`** prints a `Saved ... bytes` line. That is not an error.
+- **`clean`** deletes all of `.tmp/`. Copy what you need first.
+- **Checks:** `npm run typecheck` and `npm run typecheck:strict`. The skill has no test suite.
+
+**Canvas state recipe.** Write `.tmp/keys.js` with `(() => Object.keys(window).filter(k => !/^(on|webkit)/.test(k) && !(k in Object.getPrototypeOf(window))).slice(0, 300).join(' '))()`, run `node cli.js eval --frame <part> --file .tmp/keys.js`, then check suspicious names with `typeof`.
