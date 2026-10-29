@@ -3,11 +3,6 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-// Required on first use: --help, --version and clean must not pay ~340 ms for puppeteer.
-/** @returns {typeof import('./index')} */
-function core() {
-  return require('./index');
-}
 const T = require('./src/timeouts');
 const { spawn } = require('node:child_process');
 const { recordSite, createRun, activeRun, indexSite } = require('./src/site-mirror');
@@ -15,72 +10,11 @@ const { messageOf, settleWithin } = require('./src/util');
 const { expandEquals, isHttpUrl, parseGlobalOptions, takeFlag } = require('./src/cli/args');
 const { HELP_TEXT } = require('./src/cli/help');
 const { emit, interactiveHints, printTraffic, redactEntry, redactHeaders, redactRawText, slimEntry, slimSocket } = require('./src/cli/output');
+const { attach, core, EVAL_PROTOCOL_TIMEOUT_MS, release, releaseActive, setTabIndex, untilNotPaused, waitForFrame } = require('./src/cli/session');
 
-let tabIndex = 0; // set from --tab; every command attaches to this tab
+/** @typedef {import('./src/cli/session').Ctx} Ctx */
+/** @typedef {import('./src/cli/session').Client} Client */
 
-/**
- * Attaches to a Chrome that is already running on `port`. Never launches one:
- * a command must not open a browser on the user's profile unannounced. Use
- * `node cli.js start` for that.
- * @param {number} port
- * @returns {Promise<Client>}
- */
-async function attach(port, /** @type {{ protocolTimeout?: number }} */ options = {}) {
-  if (!(await core().checkCdpReady(port))) {
-    throw new Error(`Chrome is not running on port ${port}. Start it with: node cli.js start`);
-  }
-  return core().connect({ port, autoLaunch: false, tab: tabIndex, ...options });
-}
-
-// A page blocked by a synchronous call cannot answer CDP, and the default wait is 30 s.
-// Evals slower than 10 s fail here even if they would finish.
-const EVAL_PROTOCOL_TIMEOUT_MS = 10000;
-
-
-/**
- * @typedef {{ command: string, args: string[], port: number, isJson: boolean, outFile: string | null, tab: number }} Ctx
- */
-
-/** @typedef {InstanceType<typeof import('./src/chrome-client')>} Client */
-
-/** @type {Client | undefined} */
-let activeClient;
-
-const SLOW = Symbol('slow');
-
-/**
- * A paused page never answers Runtime.evaluate, so a call still pending after 3 s is checked for a pause.
- * The caller then gets the stop point instead of a 30 s timeout.
- * @template T
- * @param {Promise<T>} work
- * @returns {Promise<T>}
- */
-async function untilNotPaused(work) {
-  /** @type {ReturnType<typeof setTimeout> | undefined} */
-  let timer;
-  const slow = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(SLOW), 3000);
-  });
-  const first = await Promise.race([work, slow]);
-  clearTimeout(timer);
-  if (first !== SLOW) return /** @type {T} */ (first);
-  // A pause held by another live CLI command (its breakpoint is still waiting): name the stop point.
-  const held = core().DebugController.readPauseMarker();
-  if (held) throw new Error(`The page is paused in the debugger at ${held.url || held.scriptId}:${held.line} (${held.reason}), held by pid ${held.pid}. Resume it with: node cli.js resume`);
-  return work;
-}
-
-/**
- * Detaches without closing the tab: logins, SPA routes and WebSocket sessions must survive between commands.
- * Use `close` for cleanup.
- * @param {Client} client
- */
-async function release(client) {
-  if (activeClient === client) activeClient = undefined;
-  try {
-    await client.disconnect();
-  } catch {}
-}
 
 /** @param {Ctx} ctx */
 async function cmdStart({ port }) {
@@ -91,7 +25,7 @@ async function cmdStart({ port }) {
 async function cmdDumpForms({ args, port, outFile }) {
   const url = args[1] && !args[1].startsWith('--') ? args[1] : null;
 
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (url) await client.goto(url);
 
   const forms = await client.dom.dumpForms();
@@ -107,7 +41,7 @@ async function cmdDumpForms({ args, port, outFile }) {
 async function cmdDumpStorage({ args, port, outFile }) {
   const url = args[1] && !args[1].startsWith('--') ? args[1] : null;
 
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (url) await client.goto(url);
 
   const storage = await client.dom.dumpStorage();
@@ -125,7 +59,7 @@ async function cmdListeners({ args, port, outFile }) {
   const selArg = url ? args[2] : args[1];
   const selector = selArg && !selArg.startsWith('--') ? selArg : 'window';
 
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (url) await client.goto(url);
 
   const listeners = await client.dom.getEventListeners(selector);
@@ -140,7 +74,6 @@ const { createBundleCommands } = require('./src/commands/bundles');
 const bundles = createBundleCommands({
   attach: async (port) => {
     const client = await attach(port);
-    activeClient = client;
     return client;
   },
   emit,
@@ -154,7 +87,6 @@ const { createLayoutCommands } = require('./src/commands/layout');
 const { cmdLayout } = createLayoutCommands({
   attach: async (port) => {
     const client = await attach(port);
-    activeClient = client;
     return client;
   },
   emit,
@@ -168,7 +100,6 @@ const { createRevealCommands } = require('./src/commands/reveal');
 const { cmdCatchScript } = createRevealCommands({
   attach: async (port) => {
     const client = await attach(port);
-    activeClient = client;
     return client;
   },
   emit,
@@ -179,7 +110,6 @@ const { cmdCatchScript } = createRevealCommands({
 const { cmdEvents, cmdProfile } = createRuntimeCommands({
   attach: async (port) => {
     const client = await attach(port);
-    activeClient = client;
     return client;
   },
   emit,
@@ -238,7 +168,7 @@ async function cmdMirror({ args, port, tab }) {
 async function cmdMirrorRun({ args, port }) {
   const [, url, runDir] = args;
   try {
-    const client = (activeClient = await attach(port));
+    const client = (await attach(port));
     await recordSite(client, url, runDir);
   } catch (err) {
     fs.appendFileSync(path.join(runDir, 'recorder.log'), `fatal: ${err instanceof Error ? err.stack : err}\n`);
@@ -320,7 +250,7 @@ async function cmdTraffic({ args, port, isJson, outFile }) {
     if (!Number.isFinite(waitSecs) || waitSecs < 0) throw new Error('--wait expects seconds, e.g. --wait 5');
   }
 
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   client.network.clear();
   client.websocket.clear();
   await captureTraffic(client, url, waitSecs);
@@ -366,7 +296,7 @@ async function cmdEval({ args, port }) {
     throw new Error('Usage: node cli.js eval [url] <expression> [--frame <url part>] [--file <script.js>] — pass a URL to navigate first, or omit it to evaluate on the current tab');
   }
 
-  const client = (activeClient = await attach(port, { protocolTimeout: EVAL_PROTOCOL_TIMEOUT_MS }));
+  const client = (await attach(port, { protocolTimeout: EVAL_PROTOCOL_TIMEOUT_MS }));
   if (navigates) await client.goto(first);
   if (frame) await waitForFrame(client, frame);
   const result = await untilNotPaused(frame ? client.visual.frame(frame).evaluate(expression) : client.evaluate(expression));
@@ -499,7 +429,7 @@ async function evaluateOnTop(client, callFrameId, expr) {
  */
 async function cmdBreak({ args, port, outFile }) {
   const o = parseBreakArgs(args);
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (o.url) await client.goto(o.url);
   await client.debug.enable({ pauseOnExceptions: o.pauseExc });
   await client.sources.enable();
@@ -547,7 +477,7 @@ async function cmdBreak({ args, port, outFile }) {
 
 /** @param {Ctx} ctx */
 async function cmdClose({ port }) {
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const closing = client.page.url();
   await client.closePage(); // falls back to about:blank when it is the last tab, so Chrome stays up
   console.log(`Closed tab: ${closing}`);
@@ -581,7 +511,7 @@ async function frameSnapshots(client) {
 
 /** @param {Ctx} ctx */
 async function cmdSnapshot({ args, port, outFile }) {
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   let selector = args[1] && !args[1].startsWith('--') ? args[1] : null;
   if (selector && isHttpUrl(selector)) {
     await client.goto(selector, { waitUntil: 'networkidle2', timeout: T.CLI_NAV_TIMEOUT_MS });
@@ -598,7 +528,7 @@ async function cmdSnapshot({ args, port, outFile }) {
 
 /** @param {Ctx} ctx */
 async function cmdTabs({ port, outFile }) {
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   // Target info comes without touching a renderer; only the title and the visibility need the page, and
   // that is bounded so one blocked tab cannot hang the listing.
   const targets = client.browser.browserContexts().flatMap((context) => context.targets()).filter((target) => target.type() === 'page');
@@ -626,7 +556,7 @@ async function describeTab(target) {
 
 /** @param {Ctx} ctx */
 async function cmdFrames({ port, outFile }) {
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const rows = await Promise.all(client.visual.frames().map(async (frame, index) => {
     const scan = await scanFrame(client, frame);
     // canvasSizes is the canvas's own pixel size (width x height attributes), not its CSS size; game code
@@ -650,7 +580,6 @@ async function cmdStatus({ port, isJson, outFile }) {
       return null;
     });
     if (client) {
-      activeClient = client;
       info.url = client.url();
       // Bounded: on a blocked renderer the title never arrives, and status must still report the tab.
       info.title = (await settleWithin(client.title(), T.UNRESPONSIVE_WAIT_MS, 'reading the tab title')) ?? null;
@@ -696,7 +625,7 @@ async function cmdConsole({ args, port, outFile }) {
   const limit = Number(takeFlag(args, '--limit') ?? 50);
   const live = !(args[1] && isHttpUrl(args[1]));
   const wait = Number(takeFlag(args, '--wait') ?? (live ? 2 : 0.3));
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   await settleCapture(client, url, wait);
   const logs = client.console.getLogs({ type: level ?? undefined, query: filter ?? undefined });
@@ -719,7 +648,7 @@ async function cmdRaw({ args, port, outFile }) {
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
   if (!query) throw new Error('raw needs a request: raw [url] <requestId|url-substring> [--response] [--wait S]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await settleCapture(client, url, wait);
   /** @type {string} */
   let text;
@@ -746,7 +675,7 @@ async function cmdSearchBodies({ args, port, outFile }) {
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
   if (!query) throw new Error('search-bodies needs a query: search-bodies [url] <text|/regex/> [--wait S]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await settleCapture(client, url, wait);
   const matches = await client.network.searchBodies(query);
   await emit({ query, count: matches.length, matches }, outFile);
@@ -761,7 +690,7 @@ async function cmdWsFrames({ args, port, outFile }) {
   const hex = args.includes('--hex');
   const limit = Number(takeFlag(args, '--limit') ?? 50);
   const wait = Number(takeFlag(args, '--wait') ?? 3);
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   await settleCapture(client, url, wait);
   const frames = client.websocket.getFrames(undefined, {
@@ -787,7 +716,7 @@ async function cmdGlobals({ args, port, outFile }) {
   const frame = takeFlag(args, '--frame');
   const filter = takeFlag(args, '--filter');
   const limit = Number(takeFlag(args, '--limit') ?? 200);
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const owner = frame ? client.visual.frame(frame) : client.page.mainFrame();
   const list = await owner.evaluate(() => {
     const rows = [];
@@ -812,7 +741,7 @@ async function cmdObjects({ args, port, outFile }) {
   const limit = Number(takeFlag(args, '--limit') ?? 20);
   const expression = args.slice(1).filter((a) => !a.startsWith('--')).join(' ');
   if (!expression) throw new Error('objects needs a prototype expression: objects <SomeClass.prototype> [--limit N]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const objects = await client.console.queryObjects(expression, { limit });
   await emit({ expression, count: objects.length, objects }, outFile);
   await release(client);
@@ -890,7 +819,7 @@ async function cmdStep({ args, port, outFile }) {
   const timeoutS = Number(takeFlag(args, '--timeout') ?? 10);
   const o = pauseNow ? null : parseBreakArgs(args);
 
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (o?.url) await client.goto(o.url);
   await client.debug.enable({ pauseOnExceptions: o?.pauseExc });
   // The script map is the debugger's; enabling it here keeps the mask and the frame URLs working.
@@ -962,7 +891,7 @@ async function cmdStep({ args, port, outFile }) {
 async function cmdPostMessage({ args, port, outFile }) {
   const wait = Number(takeFlag(args, '--wait') ?? 3);
   const limit = Number(takeFlag(args, '--limit') ?? 50);
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   await client.dom.hookPostMessage();
   if (url) await client.goto(url, { waitUntil: 'networkidle2', timeout: T.CLI_NAV_TIMEOUT_MS });
@@ -984,7 +913,7 @@ async function cmdReplay({ args, port, outFile }) {
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
   if (!query) throw new Error('replay needs a request: replay [url] <requestId|url-substring> [--wait S]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await settleCapture(client, url, url ? wait : 0.5);
   const before = client.network.getTraffic().length;
   /** @type {string} */
@@ -1014,7 +943,7 @@ async function cmdSearchTraffic({ args, port, outFile }) {
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
   if (!query) throw new Error('search-traffic needs a query: search-traffic [url] <text|/regex/> [--wait S]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await settleCapture(client, url, wait);
   const matches = client.network.searchTraffic(query);
   await emit({
@@ -1034,7 +963,7 @@ async function cmdWsSearch({ args, port, outFile }) {
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
   if (!query) throw new Error('ws-search needs a query: ws-search [url] <text|/regex/> [--direction sent|received] [--wait S]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await settleCapture(client, url, wait);
   // A game speaks msgpack/protobuf: the payload is base64, so a text query has to look at the decoded
   // bytes, otherwise "updatePlayerInfo" never matches however many frames arrive.
@@ -1070,7 +999,7 @@ async function cmdInspect({ args, port, outFile }) {
   const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
   const expression = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
   if (!expression) throw new Error('inspect needs an expression: inspect [url] <expression|objectId>');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (url) await client.goto(url, { waitUntil: 'networkidle2', timeout: T.CLI_NAV_TIMEOUT_MS });
   const result = await client.console.inspectObject(expression);
   await emit({ expression, result }, outFile);
@@ -1079,7 +1008,7 @@ async function cmdInspect({ args, port, outFile }) {
 
 /** Lists dedicated workers, service workers and shared workers with their URLs. @param {Ctx} ctx */
 async function cmdWorkers({ port, outFile }) {
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const list = client.workers ? client.workers.list() : [];
   await emit({ count: list.length, workers: list }, outFile);
   await release(client);
@@ -1090,7 +1019,7 @@ async function cmdPurge({ args, port, outFile }) {
   const cache = args.includes('--cache');
   const cookies = args.includes('--cookies');
   if (!cache && !cookies) throw new Error('purge needs --cache and/or --cookies: purge --cache --cookies');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (cache) await client.network.clearCache();
   if (cookies) await client.network.clearCookies();
   await emit({ ok: true, cleared: { cache, cookies } }, outFile);
@@ -1153,7 +1082,7 @@ async function cmdClickAt({ args, port, outFile }) {
   if (settle) args.splice(0, args.length, ...args.filter((a) => a !== '--settle'));
   const [x0, y0] = args.slice(1).map(Number);
   if (!Number.isFinite(x0) || !Number.isFinite(y0)) throw new Error('click-at expects two numbers: click-at <x> <y> [--frame <url part>] [--canvas] [--index N]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   let x = x0, y = y0;
   /** @type {{ x: number, y: number } | undefined} */
   let scale;
@@ -1174,16 +1103,6 @@ async function cmdClickAt({ args, port, outFile }) {
   await release(client);
 }
 
-/** Waits until a child frame whose URL contains `frame` exists: iframes appear after goto, so a first call can miss them. */
-/** @param {Client} client @param {string | null} frame */
-async function waitForFrame(client, frame) {
-  if (!frame || /^\d+$/.test(frame)) return; // an index is used as-is: it does not wait
-  const found = await core().waitUntil(() => client.visual.frames().some((f) => f.url().includes(frame)), { timeout: T.CLI_NAV_TIMEOUT_MS });
-  if (!found) {
-    const seen = client.visual.frames().map((f) => f.url().slice(0, 100)).join('\n  ');
-    throw new Error(`Waited ${T.CLI_NAV_TIMEOUT_MS / 1000}s for a frame whose URL contains "${frame}". Frames seen:\n  ${seen}`);
-  }
-}
 
 /** @param {Ctx} ctx */
 async function cmdKey({ args, port, outFile }) {
@@ -1198,7 +1117,7 @@ async function cmdKey({ args, port, outFile }) {
   if (stray) throw new Error(`key takes no ${stray}. Keys go to the focused element: click the game first, then key <code...> [--hold MS]`);
   const holdMs = hold === null ? 0 : Number(hold);
   if (!Number.isFinite(holdMs) || holdMs < 0) throw new Error('--hold expects milliseconds, e.g. --hold 300');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await client.visual.key(codes, { holdMs, settle });
   await emit({ ok: true, action: 'key', codes, holdMs, settle: settle || undefined }, outFile);
   await release(client);
@@ -1220,7 +1139,7 @@ async function cmdDrag({ args, port, outFile }) {
   if (nums.length !== 4 || nums.some((n) => !Number.isFinite(n))) throw new Error('drag expects four numbers: drag <x1> <y1> <x2> <y2> [--frame <part>] [--canvas] [--button left|right|middle] [--steps N]');
   if (!Number.isFinite(steps) || steps < 1 || steps > 200) throw new Error('--steps expects 1-200, e.g. --steps 12');
   const [x1, y1, x2, y2] = nums;
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   let from = { x: x1, y: y1 };
   let to = { x: x2, y: y2 };
   /** @type {{ x: number, y: number } | undefined} */
@@ -1250,7 +1169,7 @@ async function cmdWheel({ args, port, outFile }) {
   if (settle) args.splice(0, args.length, ...args.filter((a) => a !== '--settle'));
   const [dx, dy] = args.slice(1).map(Number);
   if (!Number.isFinite(dx) || !Number.isFinite(dy)) throw new Error('wheel expects two numbers: wheel <dx> <dy> [--frame <part>] [--canvas] [--x N --y N]');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   let x = atX === null ? undefined : Number(atX);
   let y = atY === null ? undefined : Number(atY);
   // A game listens at the canvas, not at 0,0: aim the wheel at its centre unless --x/--y say otherwise.
@@ -1299,7 +1218,7 @@ async function cmdCanvas({ args, port, outFile }) {
   const preserveAt = args.indexOf('--preserve');
   const preserve = preserveAt !== -1;
   if (preserve) args.splice(preserveAt, 1);
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   if (list) {
     if (frame) await waitForFrame(client, frame);
     const canvases = await client.visual.listCanvases({ frame: frame ?? undefined });
@@ -1468,7 +1387,7 @@ async function performAction(client, action, targets) {
  */
 async function cmdInteract(ctx) {
   const { args, port, outFile, command: action } = ctx;
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   const targets = args.slice(1).filter((a) => !a.startsWith('--'));
 
   // An optional leading URL navigates first, as in every other command.
@@ -1524,7 +1443,7 @@ async function cmdInteract(ctx) {
 
 /** @param {Ctx} ctx */
 async function cmdWait({ args, port, outFile, isJson }) {
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   let selector = args[1];
   if (!selector) throw new Error('Usage: node cli.js wait [url] <selector> [--timeout S]');
   if (isHttpUrl(selector)) {
@@ -1577,7 +1496,7 @@ async function cmdWait({ args, port, outFile, isJson }) {
 async function cmdGoto({ args, port }) {
   const url = args[1];
   if (!isHttpUrl(url)) throw new Error('Usage: node cli.js goto <http(s) url>');
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await client.goto(url, { waitUntil: 'load', timeout: T.CLI_NAV_TIMEOUT_MS });
   console.log(JSON.stringify({ url: client.url(), title: await client.title() }, null, 2));
   await release(client);
@@ -1590,7 +1509,7 @@ async function cmdResume({ port }) {
     console.log('The page is not paused.');
     return;
   }
-  const client = (activeClient = await attach(port));
+  const client = (await attach(port));
   await client.cdp.send('Debugger.enable').catch(() => {});
   await client.cdp.send('Debugger.resume');
   core().DebugController.clearPauseMarker({ force: true });
@@ -1684,7 +1603,7 @@ async function main() {
   }
 
   const { positional: args, port, isJson, out: outFile, tab } = parseGlobalOptions(argv);
-  tabIndex = tab;
+  setTabIndex(tab);
   const command = args[0];
   const ctx = { command, args, port, isJson, outFile, tab };
   // Every action leaves one line in .tmp/steps.jsonl, so a later reader can see which step changed what.
@@ -1723,7 +1642,7 @@ if (require.main === module) main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    if (activeClient) await release(activeClient);
+    await releaseActive();
     // A failure inside puppeteer.connect() can leave its socket open, which keeps Node alive after the error.
     // Exit only on the error path: after a successful command, exiting could truncate a large stdout write.
     if (process.exitCode) {
