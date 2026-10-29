@@ -10,7 +10,7 @@ const { gfm } = require('turndown-plugin-gfm');
 /** @typedef {import('./types/snapshot').SnapshotElement} SnapshotElement */
 /** @typedef {import('./types/snapshot').InteractiveSnapshot} InteractiveSnapshot */
 /** An element that may carry a form value, placeholder, name, type, href, or disabled flag. Each is optional: not every element has it. */
-/** @typedef {HTMLElement & { value?: string, placeholder?: string, name?: string, type?: string, href?: string, disabled?: boolean }} FormLikeElement */
+/** @typedef {HTMLElement & { value?: string, placeholder?: string, name?: string, type?: string, href?: string, disabled?: boolean, checked?: boolean, selected?: boolean, multiple?: boolean }} FormLikeElement */
 /** A form control as read by dumpForms; every property is optional because not every element has it. */
 /** @typedef {HTMLElement & { name?: string, type?: string, value?: string, required?: boolean, disabled?: boolean }} FormControlLike */
 /** One recorded postMessage event, sent by the page or received from another window. */
@@ -132,35 +132,94 @@ class DOMController {
   async interactiveSnapshot(selector, frame = this._page) {
     return frame.evaluate((scope) => {
       const SELECTOR = 'a, button, input, select, textarea, [role=button], [role=link], [role=tab], [onclick], summary, label[for]';
+      const MAX_ELEMENTS = 150;
       const root = scope ? document.querySelector(scope) : document;
       if (!root) return null;
       const clean = (/** @type {string | null | undefined} */ s, /** @type {number} */ n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
-      // No dedupe by tag+id+text: querySelectorAll returns each element once, so such a key can only
-      // collapse distinct elements (two unnamed inputs with no text look identical).
+
+      // Visible means: no display:none / visibility:hidden / opacity:0 on the element OR AN ANCESTOR
+      // (getComputedStyle on the element itself misses a hidden container), no content-visibility:hidden,
+      // and a non-zero box — a zero-sized element cannot be clicked. checkVisibility knows the first
+      // three; older Chromium may not have it, so this falls back to the local computation.
+      /** @param {FormLikeElement} el @returns {boolean} */
+      const isVisible = (el) => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (typeof el.checkVisibility === 'function')
+          return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+        const cs = getComputedStyle(el);
+        return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+      };
+
+      // Implicit role for the tags we report, so a click target is identifiable without a role attribute.
+      /** @param {FormLikeElement} el @returns {string | undefined} */
+      const implicitRole = (el) => {
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'a') return el.hasAttribute('href') ? 'link' : undefined;
+        if (tag === 'button' || tag === 'summary') return 'button';
+        if (tag === 'select') return el.multiple ? 'listbox' : 'combobox';
+        if (tag === 'textarea') return 'textbox';
+        if (tag !== 'input') return undefined;
+        const byType = /** @type {Record<string, string>} */ ({ checkbox: 'checkbox', radio: 'radio', range: 'slider', number: 'spinbutton', button: 'button', submit: 'button', reset: 'button', image: 'button', search: 'searchbox' });
+        return byType[el.type || 'text'] || (['hidden', 'file', 'color', 'date', 'datetime-local', 'month', 'time', 'week'].includes(el.type || '') ? undefined : 'textbox');
+      };
+
+      /** @type {FormLikeElement[]} */
       const elements = [];
       let matched = 0;
-      for (const el of /** @type {NodeListOf<FormLikeElement>} */ (root.querySelectorAll(SELECTOR))) {
-        const cs = getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-        // count reports every interactive element; the list stops at 150 so the reply stays small.
-        matched += 1;
-        if (elements.length >= 150) continue;
+
+      /** @param {Element | Document | ShadowRoot} node */
+      const walk = (node) => {
+        for (let child = node.firstElementChild; child; child = child.nextElementSibling) {
+          // querySelectorAll does not cross shadow roots, so walk the composed tree instead.
+          const el = /** @type {FormLikeElement} */ (child);
+          if (el.matches(SELECTOR) && isVisible(el)) {
+            // count reports every visible interactive element; the list stops at 150 so the reply stays small.
+            matched += 1;
+            if (elements.length < MAX_ELEMENTS) elements.push(el);
+          }
+          if (el.shadowRoot) walk(el.shadowRoot);
+          walk(el);
+        }
+      };
+      const rootShadow = root.nodeType === Node.ELEMENT_NODE ? /** @type {Element} */ (root).shadowRoot : null;
+      if (rootShadow) walk(rootShadow);
+      walk(root);
+
+      const rows = elements.map((el) => {
         const rect = el.getBoundingClientRect();
         const text = clean(el.innerText || el.value || el.placeholder, 60);
-        elements.push({
+        const labelledBy = el.getAttribute('aria-labelledby');
+        const labelText = labelledBy
+          ? labelledBy.split(/\s+/).map((id) => {
+            const owner = /** @type {Document | ShadowRoot} */ (el.getRootNode());
+            const target = typeof owner.getElementById === 'function' ? owner.getElementById(id) : document.getElementById(id);
+            return target ? target.textContent : '';
+          }).filter(Boolean).join(' ')
+          : '';
+        const ariaChecked = el.getAttribute('aria-checked');
+        const isCheckable = el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio');
+        const ariaSelected = el.getAttribute('aria-selected');
+        const ariaExpanded = el.getAttribute('aria-expanded');
+        return {
           tag: el.tagName.toLowerCase(),
           id: el.id || undefined,
           name: el.name || undefined,
           type: el.type && el.tagName !== 'BUTTON' ? el.type : undefined,
+          role: el.getAttribute('role') || implicitRole(el),
           text: text || undefined,
-          href: el.tagName === 'A' ? clean(el.href, 80) : undefined,
+          href: el.tagName === 'A' && el.href ? clean(el.href, 80) : undefined,
           placeholder: clean(el.placeholder, 40) || undefined,
           value: clean(el.value, 40) || undefined,
-          disabled: el.disabled || undefined,
+          ariaLabel: clean(el.getAttribute('aria-label') || labelText, 60) || undefined,
+          checked: isCheckable ? !!el.checked : (ariaChecked === null ? undefined : ariaChecked === 'true'),
+          selected: el.tagName === 'OPTION' ? !!el.selected : (ariaSelected === null ? undefined : ariaSelected === 'true'),
+          expanded: ariaExpanded === null ? undefined : ariaExpanded === 'true',
+          disabled: (el.disabled || el.getAttribute('aria-disabled') === 'true') || undefined,
           inViewport: (rect.top < innerHeight && rect.bottom > 0) || undefined,
-        });
-      }
-      return { url: location.href, readyState: document.readyState, count: matched, truncated: matched > elements.length || undefined, elements };
+        };
+      });
+      return { url: location.href, readyState: document.readyState, count: matched, truncated: matched > rows.length || undefined, elements: rows };
     }, selector || '');
   }
 
