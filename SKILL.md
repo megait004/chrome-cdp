@@ -54,6 +54,13 @@ Work the way a person does: look, act once, read what changed, then decide.
 | Read a canvas                                                           | `canvas --frame <part> [--index N] [--out f.png] [--preserve]`                                                                                                                                                                                                                                                                                     |
 | Run JavaScript in the page or an iframe                                 | `eval [url] [--frame <part>] <expr>` or `eval --file script.js`                                                                                                                                                                                                                                                                                    |
 | Record HTTP and WebSocket traffic                                       | `traffic [url] [--bodies] [--wait S] [--headers] [--json]`                                                                                                                                                                                                                                                                                         |
+| Console messages and uncaught exceptions                                | `console [url] [--level error] [--limit N] [--wait S]`                                                                                                                                                                                                                                                                                             |
+| Raw HTTP request/response for Burp Repeater                             | `raw [url] <id|url-part> [--response]`                                                                                                                                                                                                                                                                                                            |
+| Find a string inside recorded response bodies                           | `search-bodies [url] <text|/regex/>`                                                                                                                                                                                                                                                                                                              |
+| WebSocket frames, including binary                                      | `ws-frames [url] [--direction sent|received] [--query text] [--hex] [--limit N]`                                                                                                                                                                                                                                                                  |
+| What the page put on `window` (engine, state, tokens)                   | `globals [--frame <part>] [--filter text]`                                                                                                                                                                                                                                                                                                        |
+| Live instances of a class                                              | `objects <SomeClass.prototype>`                                                                                                                                                                                                                                                                                                                   |
+| Why a command fails (Chrome, tab, page, debugger, mirror)              | `doctor`                                                                                                                                                                                                                                                                                                                                          |
 | Find and reverse a script bundle                                        | `search-sources`, `download-bundle`, `deobfuscate`, `unpack`, `ast-search`                                                                                                                                                                                                                                                                         |
 | Find code the page created at runtime (eval, Function)                  | `vm-scripts` lists them; `find-function <id> <name>` finds where a function is defined                                                                                                                                                                                                                                                             |
 | Find what makes the page slow to render                                 | `layout [url] [--wait S]`: style, layout, pre-paint and paint with the script that forced each one                                                                                                                                                                                                                                                 |
@@ -73,28 +80,35 @@ Work the way a person does: look, act once, read what changed, then decide.
 - **Recording starts at connect.** `traffic <url>` captures the load; anything before the attach is invisible. A live tab is read with `traffic --wait S` (no URL).
 - **Keys go to the focused element.** Click the game first, or `key` does nothing visible. `key` refuses `--frame`. Click an empty spot in the game (not a button) to focus it without triggering anything.
 - **Movement may use the right mouse button.** Check the game's input handlers, then send it with `click-at <x> <y> --frame <part> --canvas --button right`. A left click on an empty spot does not move the player in such games.
-- **A minimized or covered Chrome window** drops synthesized keys and hangs screenshots. `type` revives the window itself; see `references/guide.md`.
+- **A covered or minimized Chrome window** does not block synthetic keys: `ensureVisible` turns on `Emulation.setFocusEmulationEnabled` instead of raising the window. Only if that fails does it minimize and restore the window, which is the one case where a game may lose focus.
 - **Never discard output with `Out-Null` or `Select-Object -Last 1`.** A run that prints nothing can still have failed. Check the exit code and the summary line.
 - **Git Bash rewrites a leading `/`** into `C:/Program Files/Git/`. Frame arguments strip that prefix, but a frame index (`--frame 1`) or `--frame game.html` is safer than `--frame /game`.
 
 ## Canvas games and iframes
 
-Games draw on `<canvas>` inside an iframe, so there are no selectors. The loop:
+Game loop, measured on `https://deadshot.io/` (game canvas inside an iframe):
 
 ```bash
 node cli.js frames                                           # find the game frame (index, canvases, sizes, url)
+node cli.js canvas --list                                    # every canvas: index, bitmap/CSS size, visible
 node cli.js snapshot https://target.com/game                 # canvas size and any elements per frame
-node cli.js click-at 160 80 --frame game.html --canvas       # x/y in canvas pixels; the tool adds the canvas offset
+node cli.js click-at 160 80 --frame game.html --canvas       # x/y in canvas pixels; bitmap->CSS scale is applied
 node cli.js key KeyW --hold 300                              # hold a key (click the game first to focus it)
+node cli.js key KeyW+ShiftLeft --hold 200                    # chords: modifiers + one key, pressed in order
+node cli.js drag 100 100 400 300 --frame game.html --canvas  # press, move in steps, release
+node cli.js wheel 0 -400 --frame game.html                   # scroll / zoom at the last pointer position
+node cli.js canvas --screen --out .tmp/game.png              # compositor capture: WebGL pixels, no reload
+node cli.js canvas --record 10 --fps 5 --out .tmp/frames     # 10 s at 5 fps = 50 frames
 node cli.js eval --frame game.html "JSON.stringify(window.someState)"
 ```
 
+- **`canvas --list` first.** A page has ad and UI canvases too (deadshot.io has nine); `--list` names the bitmap size, CSS size and visibility of each, and the biggest visible one is chosen when you omit `--index`. Indexes are page order, so they change between loads: prefer `--list` over a remembered index.
+- **`canvas --screen` for WebGL.** `Page.captureScreenshot` with the canvas rectangle reads the composited frame, so it works without `preserveDrawingBuffer` and without reloading the game. Plain `canvas --out` (2D readback) is the fast path; `canvas --out --preserve` is the fallback that reloads the tab.
+- **`click-at --canvas` converts bitmap to CSS pixels.** It multiplies by `rect.width / canvas.width` (same for height) and returns the `scale` it used. A 2× backing store therefore needs coordinates in backing-store pixels, as drawn in the image, not CSS pixels.
 - **Canvas size settles after load.** `canvas --frame` waits for the frame and for the canvas size to hold across two samples. Its output names the frame it read. The main page has no canvas unless you read it on purpose.
-- **Clicks.** Without `--canvas`, `click-at --frame` takes coordinates from the iframe's top-left. A canvas can sit at a nonzero offset inside its iframe, and the offset differs per page, so `--canvas` exists: it adds the canvas's own offset (read from `getBoundingClientRect`). Assumes CSS px equal the canvas's on-screen size; a scaled canvas (bitmap size differs from CSS size) is not verified.
 - **Click the visible center of a button.** A hit area can start at the drawn corner, and an edge click may not register. Find the button with a canvas read or the game's own state, then click its center.
-- **2D canvas** reads back with `canvas --out` as soon as it is drawn.
-- **WebGL canvas** reads back blank unless its drawing buffer is preserved. `canvas --preserve` reloads the tab (the game restarts). Use it deliberately.
 - **Game state can be better than pixels.** Some engines keep state in globals or in functions on `window` that `eval --frame` can read. Find them with one recipe in `references/guide.md` ("Find state in a canvas game"). Do not assume names from another game. A bare identifier that is not defined throws `is not defined`, so check `typeof` first.
+- **A game's own socket speaks binary.** `ws-frames --hex` turns a binary frame into hex; a protobuf or msgpack payload stays opaque until decoded, so dump it with `--out` and decode it offline.
 
 ## Setup
 
@@ -122,6 +136,14 @@ The library's `connect()` launches Chrome if none is running; the CLI does not, 
 | `eval` hangs about 10 s, then `ProtocolError`  | Synchronous `XMLHttpRequest` (or another blocking call) in the page. Chrome blocks the page's JS thread, so CDP times out | Use `await fetch(...)` in an async expression; do not raise the timeout to hide it                                                               |
 | Hangs about 30 s, then `ProtocolError` (other) | A CDP call exceeded the protocol timeout                                                                                  | `connect({ protocolTimeout: 120000 })` for heavy work                                                                                            |
 | `Page.captureScreenshot timed out` (raw CDP)   | The window is **minimized**; compositing is suspended                                                                     | `Browser.setWindowBounds({ windowId, bounds: { windowState: 'normal' } })`                                                                       |
+
+## Reading a reply
+
+- **A reply over 60 KB goes to a file.** `emit` writes it to `.tmp/results/result-<time>.json` and prints `{savedTo, bytes, keys, note}` instead of the payload, so one capture cannot flood the context. Pass `--out <file>` to choose the path, or read the saved file.
+- **Credentials are redacted in stdout.** `traffic`, `raw` and `console` mask `Cookie`, `Authorization`, `Set-Cookie` and API-key headers (`[REDACTED]`). `--out` writes the real values, and `--no-redact` keeps them on stdout when you need to see them.
+- **`raw` is made for Burp.** `raw <id|url-part>` prints the request with its original header order and casing (`:authority`, `sec-ch-ua`), and `--response` prints the response the same way.
+- **Flags accept both spellings.** `--wait 5` and `--wait=5` parse the same. `--version` prints the version; `--help` prints every command.
+- **A JSON flag is a projection, not the raw object.** `traffic --json` keeps id, URL, method, status, type, MIME, protocol, timing, size, request headers and post body, dropping raw header maps, initiator and cookie bookkeeping (3.3 MB → 218 KB on deadshot.io). `--full` restores everything.
 
 ## Gotchas
 

@@ -40,8 +40,12 @@ const EVAL_PROTOCOL_TIMEOUT_MS = 10000;
 let activeClient;
 
 /** @param {unknown} s */
+/**
+ * A navigable URL: http(s), but also data: and file: for synthetic test pages.
+ * @param {unknown} s @returns {boolean}
+ */
 function isHttpUrl(s) {
-  return typeof s === 'string' && /^https?:\/\//i.test(s);
+  return typeof s === 'string' && /^(https?|data|file):/i.test(s);
 }
 
 const SLOW = Symbol('slow');
@@ -119,13 +123,28 @@ Commands:
                                 rendered.html and manifest.json. LATEST names the newest run
   index-site <stampDir>         Unpack every JS file of a mirror run with webcrack
                                 into <stampDir>/unpacked
-  traffic [url] [--bodies] [--wait S] [--headers]
+  traffic [url] [--bodies] [--wait S] [--headers] [--full] [--no-redact]
                                 Record network + WebSocket frames. With a URL: navigate,
                                 wait for network idle, then for the first WS frame.
                                 Without: attach to the live tab and record --wait S
                                 (default 5) while the user interacts. --bodies drains
                                 each response body into the result
   eval [url] <expression> [--frame U] [--file script.js]   (--file: read the expression from a file)
+  console [url] [--level error|warning|info|debug] [--filter text] [--limit N] [--wait S]
+                                Console messages and uncaught exceptions from this
+                                invocation (a URL navigates first; otherwise listen --wait S)
+  raw [url] <id|url-part> [--response] [--wait S] [--no-redact]
+                                Raw HTTP request (or --response) with unnormalized headers,
+                                ready to paste into Burp Repeater
+  search-bodies [url] <text|/regex/> [--wait S]
+                                Search recorded response bodies (native search + fallback)
+  ws-frames [url] [--direction sent|received] [--query text] [--hex] [--limit N] [--wait S]
+                                WebSocket frames; --hex decodes binary frames
+  globals [--frame U] [--filter text] [--limit N]
+                                Global names on window (state, engines, tokens), with type/ctor
+  objects <SomeClass.prototype> [--limit N]
+                                Live instances of a class in the V8 heap
+  doctor                        Diagnose node, Chrome, tab, page, debugger and mirror state
                                 Evaluate JavaScript in the page. Passing a URL navigates
                                 first; without one it evaluates on the current tab.
                                 --frame U runs it inside the iframe whose URL contains U
@@ -167,10 +186,12 @@ Interaction loop — operate the live tab one step at a time, like a person:
                                 to that iframe; --canvas adds the canvas offset and converts
                                 bitmap pixels to CSS pixels (a scaled canvas is handled).
                                 --settle waits for network idle first (only after a load)
-  drag <x1> <y1> <x2> <y2> [--frame U] [--button] [--steps N]
-                                Press, move in steps, release: aiming, sliders, map pans
-  wheel <dx> <dy> [--frame U] [--x N --y N]
-                                Real mouse wheel at the frame centre unless x/y are given
+  drag <x1> <y1> <x2> <y2> [--frame U] [--canvas] [--index N] [--button left|right|middle] [--steps N]
+                                Press, move in steps, release: aiming, sliders, map pans.
+                                --canvas converts bitmap pixels like click-at
+  wheel <dx> <dy> [--frame U] [--canvas] [--index N] [--x N --y N]
+                                Real mouse wheel at the frame centre (or the canvas centre
+                                with --canvas) unless x/y are given
   key <code...> [--hold MS]     Hold one key or a chord (KeyW+ShiftLeft) on the focused
                                 element. Click the game first so its frame has focus
   canvas [--list] [--frame U] [--index N] [--out F.png] [--screen] [--record S --fps N] [--preserve]
@@ -193,6 +214,7 @@ Options:
                                 prints the path plus a short summary (every command
                                 that produces structured output)
   --help                        Display this help message
+  --version                     Print the version
 `;
 
 /**
@@ -230,6 +252,9 @@ function parseGlobalOptions(argv) {
   return { positional, port, isJson, out, tab };
 }
 
+/** Above this size a reply is written to a file instead of stdout, so it cannot flood an agent's context. */
+const MAX_INLINE_BYTES = 60_000;
+
 /**
  * Writes the JSON result to stdout, or to `--out <file>`. A file keeps large output out of the agent's context.
  * @param {object} result JSON-serializable command result
@@ -242,9 +267,19 @@ async function emit(result, outFile) {
     fs.mkdirSync(path.dirname(abs), { recursive: true }); // agents forget to mkdir
     await fs.promises.writeFile(abs, json, 'utf8');
     console.log(`Saved ${Buffer.byteLength(json)} bytes of JSON to: ${abs}`);
-  } else {
-    console.log(json);
+    return;
   }
+  if (Buffer.byteLength(json) > MAX_INLINE_BYTES) {
+    // A reply this large costs more context than the answer is worth. File it and say where.
+    const dir = path.join(__dirname, '.tmp', 'results');
+    fs.mkdirSync(dir, { recursive: true });
+    const abs = path.join(dir, `result-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+    await fs.promises.writeFile(abs, json, 'utf8');
+    const keys = result && typeof result === 'object' ? Object.keys(result).slice(0, 10) : [];
+    console.log(JSON.stringify({ savedTo: abs, bytes: Buffer.byteLength(json), keys, note: 'Reply was over 60 KB, so it went to a file. Read it, or pass --out <file> to choose the path.' }, null, 2));
+    return;
+  }
+  console.log(json);
 }
 
 /**
@@ -520,6 +555,81 @@ function printTraffic(httpTraffic, wsSockets, finalUrl, showHeaders) {
   });
 }
 
+/** Headers whose value is a credential. Redacted when a reply is printed to stdout, kept in --out files. */
+const SECRET_HEADERS = /^(cookie|set-cookie|authorization|proxy-authorization|x-api-key|api-key|x-auth-token)$/i;
+
+/**
+ * @template {Record<string, string> | null} T
+ * @param {T} headers
+ * @returns {T}
+ */
+function redactHeaders(headers) {
+  if (!headers) return headers;
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [name, value] of Object.entries(headers)) out[name] = SECRET_HEADERS.test(name) ? '[REDACTED]' : value;
+  return /** @type {T} */ (out);
+}
+
+/** @param {string} text */
+function redactRawText(text) {
+  return text.replace(/^(cookie|set-cookie|authorization|proxy-authorization|x-api-key|api-key|x-auth-token):[^\r\n]*/gim, '$1: [REDACTED]');
+}
+
+/** @param {import('./src/network-controller').TrafficEntry} entry */
+function redactEntry(entry) {
+  const copy = { ...entry };
+  copy.headers = redactHeaders(entry.headers);
+  copy.rawHeaders = redactHeaders(entry.rawHeaders);
+  copy.responseHeaders = redactHeaders(entry.responseHeaders);
+  copy.rawResponseHeaders = redactHeaders(entry.rawResponseHeaders);
+  if (typeof entry.rawResponseHeadersText === 'string')
+    copy.rawResponseHeadersText = entry.rawResponseHeadersText.replace(/^(cookie|set-cookie|authorization|proxy-authorization|x-api-key|api-key):[^\r\n]*/gim, '$1: [REDACTED]');
+  return copy;
+}
+
+/**
+ * The fields a reader needs to find a request and decide what to read next. The raw header maps,
+ * initiator and cookie bookkeeping are what make a full capture megabytes for a page like deadshot.io.
+ * @param {import('./src/network-controller').TrafficEntry & { body?: unknown, parsedJson?: unknown }} entry
+ * @param {boolean} redact
+ */
+function slimEntry(entry, redact) {
+  return {
+    id: entry.id,
+    url: entry.url,
+    method: entry.method,
+    status: entry.status,
+    statusText: entry.statusText,
+    resourceType: entry.resourceType,
+    mimeType: entry.mimeType,
+    protocol: entry.protocol,
+    startTime: entry.startTime,
+    durationMs: entry.durationMs,
+    encodedDataLength: entry.encodedDataLength,
+    failed: entry.failed || undefined,
+    errorText: entry.errorText || undefined,
+    redirectIndex: entry.redirectIndex || undefined,
+    redirectedFrom: entry.redirectedFrom || undefined,
+    redirectedTo: entry.redirectedTo || undefined,
+    postData: entry.postData || undefined,
+    headers: redact ? redactHeaders(entry.headers) : entry.headers,
+    ...('body' in entry ? { body: entry.body } : {}),
+    ...('parsedJson' in entry ? { parsedJson: entry.parsedJson } : {}),
+  };
+}
+
+/** @param {import('./src/types/websocket').WsSocket} socket @param {boolean} redact */
+function slimSocket(socket, redact) {
+  return {
+    url: socket.url,
+    state: socket.state,
+    frames: socket.frames.length,
+    handshakeRequest: socket.handshakeRequest ? { headers: redact ? redactHeaders(socket.handshakeRequest.headers) : socket.handshakeRequest.headers } : null,
+    handshakeResponse: socket.handshakeResponse ? { status: socket.handshakeResponse.status, headers: redact ? redactHeaders(socket.handshakeResponse.headers) : socket.handshakeResponse.headers } : null,
+  };
+}
+
 /** @param {Ctx} ctx */
 async function cmdTraffic({ args, port, isJson, outFile }) {
   // With a URL: navigate there and capture the load. Without: attach to
@@ -553,10 +663,18 @@ async function cmdTraffic({ args, port, isJson, outFile }) {
   // Read bodies now, while Chrome still holds them.
   if (args.includes('--bodies')) result.httpTraffic = await withBodies(client, httpTraffic);
 
+  // Agents read this reply in their context: keep it small, and keep session cookies out of it.
+  // --full restores every field; --no-redact keeps credentials; --out writes the file unredacted.
+  const full = args.includes('--full');
+  const redact = !args.includes('--no-redact') && !outFile;
   if (isJson || outFile) {
+    const records = full ? result.httpTraffic.map((entry) => (redact ? redactEntry(entry) : entry)) : result.httpTraffic.map((entry) => slimEntry(entry, redact));
+    result.httpTraffic = /** @type {any} */ (records);
+    result.wsSockets = /** @type {any} */ (result.wsSockets.map((socket) => slimSocket(socket, redact)));
     await emit(result, outFile);
   } else {
-    printTraffic(httpTraffic, wsSockets, result.finalUrl, args.includes('--headers'));
+    const rows = redact ? httpTraffic.map(redactEntry) : httpTraffic;
+    printTraffic(rows, wsSockets, result.finalUrl, args.includes('--headers'));
   }
 
   await release(client);
@@ -779,9 +897,11 @@ async function scanFrame(client, frame) {
 /** @param {Client} client */
 async function frameSnapshots(client) {
   const scans = await Promise.all(client.visual.frames().map(async (frame, index) => ({ index, frame, ...(await scanFrame(client, frame)) })));
-  return scans
-    .filter(({ canvases, elements }) => canvases.length || elements.length)
-    .map(({ index, frame, canvases, elements }) => ({ frame: index, url: frame.url(), canvases, elements }));
+  const rows = scans.map(({ index, frame, canvases, elements }) => ({ frame: index, url: frame.url(), canvases, elements }));
+  // A frame that is still loading has nothing to report yet. Returning [] then would read as "no iframes",
+  // so fall back to the bare URLs; the caller can see the frame exists and read it again.
+  const withContent = rows.filter((row) => row.canvases.length || row.elements.length);
+  return withContent.length ? withContent : rows;
 }
 
 /** @param {Ctx} ctx */
@@ -889,6 +1009,175 @@ async function cmdStatus({ port }) {
   console.log(`Mirror recording: ${recording} (${saved} responses saved, last write ${idle}s ago)`);
 }
 
+/**
+ * Captures this invocation's recording: navigate when a URL is given, otherwise listen to the live tab.
+ * The network, console and WebSocket recorders live in this process, so a read must happen in the same call.
+ * @param {Client} client @param {string | null} url @param {number} seconds
+ */
+async function settleCapture(client, url, seconds) {
+  if (url) await client.goto(url, { waitUntil: 'networkidle2', timeout: T.CLI_NAV_TIMEOUT_MS });
+  const ms = Math.max(0, seconds) * 1000;
+  if (ms) await new Promise((r) => setTimeout(r, ms));
+}
+
+/** @param {Ctx} ctx */
+async function cmdConsole({ args, port, outFile }) {
+  const level = takeFlag(args, '--level');
+  const filter = takeFlag(args, '--filter');
+  const limit = Number(takeFlag(args, '--limit') ?? 50);
+  const live = !(args[1] && isHttpUrl(args[1]));
+  const wait = Number(takeFlag(args, '--wait') ?? (live ? 2 : 0.3));
+  const client = (activeClient = await attach(port));
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  await settleCapture(client, url, wait);
+  const logs = client.console.getLogs({ type: level ?? undefined, query: filter ?? undefined });
+  const rows = logs.slice(-limit).map((entry) => ({
+    type: entry.type,
+    text: String(entry.text ?? '').slice(0, 400),
+    url: entry.url,
+    line: entry.lineNumber,
+    at: entry.timestamp,
+  }));
+  await emit({ count: logs.length, level: level ?? 'all', filter: filter ?? null, messages: rows }, outFile);
+  await release(client);
+}
+
+/** @param {Ctx} ctx */
+async function cmdRaw({ args, port, outFile }) {
+  const response = args.includes('--response');
+  if (response) args.splice(0, args.length, ...args.filter((a) => a !== '--response'));
+  const wait = Number(takeFlag(args, '--wait') ?? 1.5);
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
+  if (!query) throw new Error('raw needs a request: raw [url] <requestId|url-substring> [--response] [--wait S]');
+  const client = (activeClient = await attach(port));
+  await settleCapture(client, url, wait);
+  const text = response ? await client.network.toRawResponse(query) : await client.network.toRawRequest(query);
+  if (outFile) {
+    const abs = path.resolve(outFile);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    await fs.promises.writeFile(abs, text, 'utf8');
+    console.log(`Saved ${Buffer.byteLength(text)} bytes of raw HTTP to: ${abs}`);
+  } else {
+    // Session cookies are credentials; a reply goes into an agent's context. Keep them for --out only.
+    console.log(args.includes('--no-redact') ? text : redactRawText(text));
+  }
+  await release(client);
+}
+
+/** @param {Ctx} ctx */
+async function cmdSearchBodies({ args, port, outFile }) {
+  const wait = Number(takeFlag(args, '--wait') ?? 1.5);
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
+  if (!query) throw new Error('search-bodies needs a query: search-bodies [url] <text|/regex/> [--wait S]');
+  const client = (activeClient = await attach(port));
+  await settleCapture(client, url, wait);
+  const matches = await client.network.searchBodies(query);
+  await emit({ query, count: matches.length, matches }, outFile);
+  await release(client);
+}
+
+/** @param {Ctx} ctx */
+async function cmdWsFrames({ args, port, outFile }) {
+  const direction = takeFlag(args, '--direction');
+  if (direction && direction !== 'sent' && direction !== 'received') throw new Error('--direction must be sent or received');
+  const query = takeFlag(args, '--query');
+  const hex = args.includes('--hex');
+  const limit = Number(takeFlag(args, '--limit') ?? 50);
+  const wait = Number(takeFlag(args, '--wait') ?? 3);
+  const client = (activeClient = await attach(port));
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  await settleCapture(client, url, wait);
+  const frames = client.websocket.getFrames(undefined, {
+    direction: /** @type {'sent' | 'received' | undefined} */ (direction ?? undefined),
+    query: query ?? undefined,
+  });
+  const rows = frames.slice(-limit).map((frame) => ({
+    direction: frame.direction,
+    opcode: frame.opcode,
+    binary: frame.isBinary || undefined,
+    bytes: frame.isBinary ? Buffer.from(frame.payloadData, 'base64').length : Buffer.byteLength(frame.payloadData),
+    payload: hex && frame.isBinary ? Buffer.from(frame.payloadData, 'base64').toString('hex').slice(0, 512) : frame.payloadData.slice(0, 500),
+    json: frame.parsedJson,
+    socket: frame.url,
+    at: frame.wallTime,
+  }));
+  await emit({ count: frames.length, direction: direction ?? 'both', query: query ?? null, frames: rows }, outFile);
+  await release(client);
+}
+
+/** @param {Ctx} ctx */
+async function cmdGlobals({ args, port, outFile }) {
+  const frame = takeFlag(args, '--frame');
+  const filter = takeFlag(args, '--filter');
+  const limit = Number(takeFlag(args, '--limit') ?? 200);
+  const client = (activeClient = await attach(port));
+  const owner = frame ? client.visual.frame(frame) : client.page.mainFrame();
+  const list = await owner.evaluate(() => {
+    const rows = [];
+    for (const key of Object.getOwnPropertyNames(window)) {
+      if (/^(webkit|moz|on)/.test(key)) continue;
+      try {
+        const value = /** @type {Record<string, any>} */ (/** @type {unknown} */ (window))[key];
+        rows.push({ key, type: typeof value, ctor: value && typeof value === 'object' && value.constructor ? value.constructor.name : undefined });
+      } catch {
+        rows.push({ key, type: 'unreadable' });
+      }
+    }
+    return rows;
+  });
+  const rows = list.filter((r) => !filter || r.key.toLowerCase().includes(filter.toLowerCase())).slice(0, limit);
+  await emit({ url: client.url(), count: list.length, filter: filter ?? null, globals: rows }, outFile);
+  await release(client);
+}
+
+/** @param {Ctx} ctx */
+async function cmdObjects({ args, port, outFile }) {
+  const limit = Number(takeFlag(args, '--limit') ?? 20);
+  const expression = args.slice(1).filter((a) => !a.startsWith('--')).join(' ');
+  if (!expression) throw new Error('objects needs a prototype expression: objects <SomeClass.prototype> [--limit N]');
+  const client = (activeClient = await attach(port));
+  const objects = await client.console.queryObjects(expression, { limit });
+  await emit({ expression, count: objects.length, objects }, outFile);
+  await release(client);
+}
+
+/** @param {Ctx} ctx */
+async function cmdDoctor({ port }) {
+  const pkg = require('./package.json');
+  /** @type {Array<{ check: string, ok: boolean, detail?: string }>} */
+  const checks = [];
+  const add = (/** @type {string} */ check, /** @type {boolean} */ ok, /** @type {string} */ detail = '') => checks.push({ check, ok, detail });
+  add('node', Number(process.versions.node.split('.')[0]) >= 20, process.version);
+  const version = await checkCdpReady(port);
+  add('chrome', Boolean(version), version ? `${version.Browser} on port ${port}` : `not reachable on port ${port} (run: node cli.js start)`);
+  if (version) {
+    try {
+      const client = await attach(port);
+      const tabs = await client.browser.browserContexts().flatMap((c) => c.targets()).filter((t) => t.type() === 'page');
+      add('tabs', tabs.length > 0, `${tabs.length} page target(s), attached to tab 0`);
+      const page = await client.page.evaluate(() => ({ url: location.href, title: document.title, readyState: document.readyState, focused: document.hasFocus(), visible: document.visibilityState === 'visible' })).catch(() => null);
+      add('page', Boolean(page), page ? `${page.url} - ${page.title} (${page.readyState}, focused=${page.focused}, visible=${page.visible})` : 'not readable (a busy renderer?)');
+      const errors = client.console.getLogs({ type: 'error' }).length;
+      add('console', true, `${errors} recorded error(s) in this session`);
+      const paused = DebugController.readPauseMarker();
+      add('debugger', !paused, paused ? `paused at ${paused.url || paused.scriptId}:${paused.line} (pid ${paused.pid}) - run: node cli.js resume` : 'no pause held');
+      await release(client);
+    } catch (error) {
+      add('attach', false, messageOf(error));
+    }
+  } else {
+    add('attach', false, 'skipped: no Chrome');
+  }
+  const mirrorDir = activeRun(path.join(__dirname, '.tmp/mirror'));
+  add('mirror', true, mirrorDir ? `recording into ${mirrorDir}` : 'none');
+  const tmpDir = path.join(__dirname, '.tmp');
+  add('workspace', true, fs.existsSync(tmpDir) ? `.tmp present (${fs.readdirSync(tmpDir).length} entries)` : '.tmp missing (created on demand)');
+  console.log(JSON.stringify({ ok: checks.every((c) => c.ok), version: pkg.version, port, checks }, null, 2));
+  if (!checks.every((c) => c.ok)) process.exitCode = 1;
+}
+
 async function cmdClean() {
   const dir = path.join(__dirname, '.tmp');
   fs.rmSync(dir, { recursive: true, force: true });
@@ -911,6 +1200,19 @@ async function resolveCanvasIndex(client, frame, requested) {
   const pool = visible.length ? visible : list;
   pool.sort((a, b) => b.width * b.height - a.width * a.height);
   return pool[0].index;
+}
+
+/**
+ * Canvas-bitmap pixels -> frame-relative CSS pixels, plus the scale that was applied.
+ * A game canvas is often scaled by CSS, so a bitmap pixel is not a CSS pixel.
+ * @param {Client} client @param {string | null} frame @param {number | null} requested @param {number} x @param {number} y
+ */
+async function toCanvasPoint(client, frame, requested, x, y) {
+  if (frame) await waitForFrame(client, frame);
+  const index = await resolveCanvasIndex(client, frame, requested);
+  const info = await client.visual.canvasInfo({ frame: frame ?? undefined, index });
+  const scale = { x: info.rect.width ? info.bitmap.width / info.rect.width : 1, y: info.rect.height ? info.bitmap.height / info.rect.height : 1 };
+  return { x: info.rect.x + x / scale.x, y: info.rect.y + y / scale.y, scale, bitmap: info.bitmap, index, rect: info.rect };
 }
 
 /** @param {Ctx} ctx */
@@ -986,15 +1288,30 @@ async function cmdDrag({ args, port, outFile }) {
   const button = takeFlag(args, '--button') ?? 'left';
   if (!['left', 'middle', 'right'].includes(button)) throw new Error(`--button must be left, middle or right (got "${button}")`);
   const steps = Number(takeFlag(args, '--steps') ?? 12);
+  const indexRaw = takeFlag(args, '--index');
+  const requestedIndex = indexRaw === null ? null : Number(indexRaw);
+  const canvasRelative = args.includes('--canvas');
   const settle = args.includes('--settle');
+  if (canvasRelative) args.splice(0, args.length, ...args.filter((a) => a !== '--canvas'));
   if (settle) args.splice(0, args.length, ...args.filter((a) => a !== '--settle'));
   const nums = args.slice(1).map(Number);
-  if (nums.length !== 4 || nums.some((n) => !Number.isFinite(n))) throw new Error('drag expects four numbers: drag <x1> <y1> <x2> <y2> [--frame <part>] [--button left|right|middle] [--steps N]');
+  if (nums.length !== 4 || nums.some((n) => !Number.isFinite(n))) throw new Error('drag expects four numbers: drag <x1> <y1> <x2> <y2> [--frame <part>] [--canvas] [--button left|right|middle] [--steps N]');
   if (!Number.isFinite(steps) || steps < 1 || steps > 200) throw new Error('--steps expects 1-200, e.g. --steps 12');
   const [x1, y1, x2, y2] = nums;
   const client = (activeClient = await attach(port));
-  await client.visual.drag({ x: x1, y: y1 }, { x: x2, y: y2 }, { frame: frame ?? undefined, button: /** @type {'left' | 'middle' | 'right'} */ (button), steps, settle });
-  await emit({ ok: true, action: 'drag', from: [x1, y1], to: [x2, y2], button, frame: frame ?? null, steps }, outFile);
+  let from = { x: x1, y: y1 };
+  let to = { x: x2, y: y2 };
+  /** @type {{ x: number, y: number } | undefined} */
+  let scale;
+  if (canvasRelative) {
+    const a = await toCanvasPoint(client, frame, requestedIndex, x1, y1);
+    const b = await toCanvasPoint(client, frame, requestedIndex, x2, y2);
+    from = { x: a.x, y: a.y };
+    to = { x: b.x, y: b.y };
+    scale = a.scale;
+  }
+  await client.visual.drag(from, to, { frame: frame ?? undefined, button: /** @type {'left' | 'middle' | 'right'} */ (button), steps, settle });
+  await emit({ ok: true, action: 'drag', from: [x1, y1], to: [x2, y2], button, frame: frame ?? null, canvas: canvasRelative, scale, steps }, outFile);
   await release(client);
 }
 
@@ -1003,15 +1320,25 @@ async function cmdWheel({ args, port, outFile }) {
   const frame = takeFlag(args, '--frame');
   const atX = takeFlag(args, '--x');
   const atY = takeFlag(args, '--y');
+  const indexRaw = takeFlag(args, '--index');
+  const requestedIndex = indexRaw === null ? null : Number(indexRaw);
+  const canvasRelative = args.includes('--canvas');
   const settle = args.includes('--settle');
+  if (canvasRelative) args.splice(0, args.length, ...args.filter((a) => a !== '--canvas'));
   if (settle) args.splice(0, args.length, ...args.filter((a) => a !== '--settle'));
   const [dx, dy] = args.slice(1).map(Number);
-  if (!Number.isFinite(dx) || !Number.isFinite(dy)) throw new Error('wheel expects two numbers: wheel <dx> <dy> [--frame <part>] [--x N --y N]');
-  const x = atX === null ? undefined : Number(atX);
-  const y = atY === null ? undefined : Number(atY);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) throw new Error('wheel expects two numbers: wheel <dx> <dy> [--frame <part>] [--canvas] [--x N --y N]');
   const client = (activeClient = await attach(port));
+  let x = atX === null ? undefined : Number(atX);
+  let y = atY === null ? undefined : Number(atY);
+  // A game listens at the canvas, not at 0,0: aim the wheel at its centre unless --x/--y say otherwise.
+  if (canvasRelative && (x === undefined || y === undefined)) {
+    const p = await toCanvasPoint(client, frame, requestedIndex, 0, 0);
+    x = p.rect.x + p.rect.width / 2;
+    y = p.rect.y + p.rect.height / 2;
+  }
   await client.visual.wheel(dx, dy, { frame: frame ?? undefined, x, y, settle });
-  await emit({ ok: true, action: 'wheel', deltaX: dx, deltaY: dy, frame: frame ?? null, x: x ?? null, y: y ?? null }, outFile);
+  await emit({ ok: true, action: 'wheel', deltaX: dx, deltaY: dy, frame: frame ?? null, canvas: canvasRelative, x: x ?? null, y: y ?? null }, outFile);
   await release(client);
 }
 
@@ -1356,8 +1683,24 @@ function recordStep(step) {
   fs.appendFileSync(file, `${JSON.stringify(step)}\n`);
 }
 
+/**
+ * `--flag=value` -> `--flag value`, so both spellings parse the same.
+ * @param {string[]} argv @returns {string[]}
+ */
+function expandEquals(argv) {
+  return argv.flatMap((/** @type {string} */ arg) => {
+    const m = /^--([a-z0-9-]+)=([\s\S]*)$/i.exec(arg);
+    return m ? [`--${m[1]}`, m[2]] : [arg];
+  });
+}
+
 async function main() {
-  const argv = process.argv.slice(2);
+  const argv = expandEquals(process.argv.slice(2));
+
+  if (argv.includes('--version') || argv.includes('-v')) {
+    console.log(require('./package.json').version);
+    process.exit(0);
+  }
 
   if (!argv[0] || argv.includes('--help') || argv.includes('-h')) {
     console.log(HELP_TEXT);
@@ -1413,6 +1756,12 @@ async function main() {
     case 'mirror-run': await cmdMirrorRun(ctx); break;
     case 'index-site': await cmdIndexSite(ctx); break;
     case 'traffic': await cmdTraffic(ctx); break;
+    case 'console': await cmdConsole(ctx); break;
+    case 'raw': await cmdRaw(ctx); break;
+    case 'search-bodies': await cmdSearchBodies(ctx); break;
+    case 'ws-frames': await cmdWsFrames(ctx); break;
+    case 'globals': await cmdGlobals(ctx); break;
+    case 'objects': await cmdObjects(ctx); break;
 
     case 'eval': await cmdEval(ctx); break;
 
@@ -1432,6 +1781,7 @@ async function main() {
     case 'tabs': await cmdTabs(ctx); break;
     case 'frames': await cmdFrames(ctx); break;
     case 'status': await cmdStatus(ctx); break;
+    case 'doctor': await cmdDoctor(ctx); break;
     case 'resume': await cmdResume(ctx); break;
     case 'goto': await cmdGoto(ctx); break;
     case 'clean': await cmdClean(); break;

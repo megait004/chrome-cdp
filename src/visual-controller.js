@@ -4,6 +4,8 @@
 /** @type {Record<string, number>} */
 const KEY_CODES = {
   Space: 32, Enter: 13, Escape: 27, Shift: 16, Control: 17, Alt: 18, Tab: 9,
+  ShiftLeft: 16, ShiftRight: 16, ControlLeft: 17, ControlRight: 17, AltLeft: 18, AltRight: 18,
+  MetaLeft: 91, MetaRight: 92, CapsLock: 20, Insert: 45,
   ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
   Backspace: 8, Delete: 46, Home: 36, End: 35, PageUp: 33, PageDown: 34,
 };
@@ -16,7 +18,9 @@ function keyCodeOf(code) {
   if (letter) return letter[1].codePointAt(0);
   const digit = /^Digit(\d)$/.exec(code);
   if (digit) return digit[1].codePointAt(0);
-  throw new Error(`Unknown key code "${code}". Use a KeyboardEvent.code such as KeyW, Space, ArrowLeft (or KeyA-KeyZ, Digit0-Digit9).`);
+  const fn = /^F([1-9]|1[0-2])$/.exec(code);
+  if (fn) return 111 + Number(fn[1]);
+  throw new Error(`Unknown key code "${code}". Use a KeyboardEvent.code such as KeyW, Space, ArrowLeft, ShiftLeft (or KeyA-KeyZ, Digit0-Digit9, F1-F12).`);
 }
 
 /**

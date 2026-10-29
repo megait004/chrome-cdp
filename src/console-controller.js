@@ -228,9 +228,20 @@ class ConsoleController extends EventEmitter {
    */
   /** @param {import('devtools-protocol').Protocol.Runtime.ConsoleAPICalledEvent} event */
   _onConsoleAPICalled(event) {
-    const text = event.args
-      .map((/** @type {import('devtools-protocol').Protocol.Runtime.RemoteObject} */ a) => (a.value !== undefined ? String(a.value) : a.description || ''))
-      .join(' ');
+    // console.log(obj) used to read "Object"; a preview turns it into data the agent can use.
+    const format = (/** @type {import('devtools-protocol').Protocol.Runtime.RemoteObject} */ a) => {
+      if (a.type === 'string') return String(a.value);
+      if (a.value !== undefined) return String(a.value);
+      const preview = a.preview;
+      if (preview?.properties?.length) {
+        const body = preview.properties
+          .map((p) => `${p.name}: ${p.type === 'string' ? JSON.stringify(p.value) : p.value}`)
+          .join(', ');
+        return `${preview.description ?? a.description ?? 'Object'} {${body}${preview.overflow ? ', ...' : ''}}`;
+      }
+      return a.description || '';
+    };
+    const text = event.args.map(format).join(' ');
 
     const stackTrace =
       event.stackTrace?.callFrames?.map((/** @type {import('devtools-protocol').Protocol.Runtime.CallFrame} */ f) => ({
