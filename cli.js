@@ -1471,7 +1471,10 @@ async function cmdClean() {
 async function resolveCanvasIndex(client, frame, requested) {
   if (requested !== null) return requested;
   const list = await client.visual.listCanvases({ frame: frame ?? undefined });
-  if (!list.length) throw new Error(`No <canvas> ${frame ? `in frame "${frame}"` : 'on the page'}. Run: node cli.js canvas --list`);
+  if (!list.length) {
+    const where = frame ? `in frame "${frame}"` : 'on the page';
+    throw new Error(`No <canvas> ${where}. Run: node cli.js canvas --list`);
+  }
   const visible = list.filter((c) => c.visible);
   const pool = visible.length ? visible : list;
   pool.sort((a, b) => b.width * b.height - a.width * a.height);
@@ -1690,11 +1693,13 @@ async function cmdCanvas({ args, port, outFile }) {
     const started = Date.now();
     let last = null;
     for (let i = 1; i <= total; i++) {
-      const shot = await client.visual.canvasScreenshot({ frame: frame ?? undefined, index: canvasIndex });
+      // A recording is a timed sequence: each frame is captured, then the loop waits for the next slot.
+      // Promise.all would capture N frames at once, all with the same timestamp.
+      const shot = await client.visual.canvasScreenshot({ frame: frame ?? undefined, index: canvasIndex }); // NOSONAR S9382
       fs.writeFileSync(path.join(dir, `f${String(i).padStart(4, '0')}.png`), shot.buffer);
       last = shot;
       const wait = started + (i * 1000) / fps - Date.now();
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait)); // NOSONAR S9382
     }
     console.log(JSON.stringify({ ok: true, action: 'canvas-record', dir, frames: total, fps, seconds, width: last?.width, height: last?.height, canvasIndex, owner }, null, 2));
     await release(client);
@@ -1970,6 +1975,69 @@ function expandEquals(argv) {
   });
 }
 
+/**
+ * Command table: one lookup instead of a 52-case switch. The handlers are function declarations, so they are
+ * hoisted and this literal can sit above main().
+ * @type {Record<string, (ctx: Ctx) => Promise<unknown>>}
+ */
+const COMMANDS = {
+  'start': cmdStart,
+  'dump-forms': cmdDumpForms,
+  'dump-storage': cmdDumpStorage,
+  'listeners': cmdListeners,
+  'search-sources': cmdSearchSources,
+  'download-bundle': cmdDownloadBundle,
+  'deobfuscate': cmdDeobfuscate,
+  'unpack': cmdUnpack,
+  'ast-search': cmdAstSearch,
+  'vm-scripts': cmdVmScripts,
+  'find-function': cmdFindFunction,
+  'snippet': cmdSnippet,
+  'layout': cmdLayout,
+  'catch-script': cmdCatchScript,
+  'events': cmdEvents,
+  'profile': cmdProfile,
+  'mirror': cmdMirror,
+  'mirror-run': cmdMirrorRun,
+  'index-site': cmdIndexSite,
+  'traffic': cmdTraffic,
+  'console': cmdConsole,
+  'raw': cmdRaw,
+  'search-bodies': cmdSearchBodies,
+  'ws-frames': cmdWsFrames,
+  'globals': cmdGlobals,
+  'objects': cmdObjects,
+  'eval': cmdEval,
+  'break': cmdBreak,
+  'close': cmdClose,
+  'snapshot': cmdSnapshot,
+  'click': cmdInteract,
+  'type': cmdInteract,
+  'fill': cmdInteract,
+  'press': cmdInteract,
+  'tabs': cmdTabs,
+  'frames': cmdFrames,
+  'status': cmdStatus,
+  'step': cmdStep,
+  'postmessage': cmdPostMessage,
+  'replay': cmdReplay,
+  'search-traffic': cmdSearchTraffic,
+  'ws-search': cmdWsSearch,
+  'inspect': cmdInspect,
+  'workers': cmdWorkers,
+  'purge': cmdPurge,
+  'doctor': cmdDoctor,
+  'resume': cmdResume,
+  'goto': cmdGoto,
+  'click-at': cmdClickAt,
+  'drag': cmdDrag,
+  'wheel': cmdWheel,
+  'key': cmdKey,
+  'canvas': cmdCanvas,
+  'wait': cmdWait,
+  'clean': cmdClean,
+};
+
 async function main() {
   const argv = expandEquals(process.argv.slice(2));
 
@@ -2002,85 +2070,13 @@ async function main() {
     }));
   }
 
-  switch (command) {
-    case 'start': await cmdStart(ctx); break;
-
-    case 'dump-forms': await cmdDumpForms(ctx); break;
-
-    case 'dump-storage': await cmdDumpStorage(ctx); break;
-
-    case 'listeners': await cmdListeners(ctx); break;
-
-    case 'search-sources': await cmdSearchSources(ctx); break;
-
-    case 'download-bundle': await cmdDownloadBundle(ctx); break;
-
-    case 'deobfuscate': await cmdDeobfuscate(ctx); break;
-
-    case 'unpack': await cmdUnpack(ctx); break;
-
-    case 'ast-search': await cmdAstSearch(ctx); break;
-    case 'vm-scripts': await cmdVmScripts(ctx); break;
-    case 'find-function': await cmdFindFunction(ctx); break;
-    case 'snippet': await cmdSnippet(ctx); break;
-    case 'layout': await cmdLayout(ctx); break;
-    case 'catch-script': await cmdCatchScript(ctx); break;
-    case 'events': await cmdEvents(ctx); break;
-    case 'profile': await cmdProfile(ctx); break;
-
-    case 'mirror': await cmdMirror(ctx); break;
-    case 'mirror-run': await cmdMirrorRun(ctx); break;
-    case 'index-site': await cmdIndexSite(ctx); break;
-    case 'traffic': await cmdTraffic(ctx); break;
-    case 'console': await cmdConsole(ctx); break;
-    case 'raw': await cmdRaw(ctx); break;
-    case 'search-bodies': await cmdSearchBodies(ctx); break;
-    case 'ws-frames': await cmdWsFrames(ctx); break;
-    case 'globals': await cmdGlobals(ctx); break;
-    case 'objects': await cmdObjects(ctx); break;
-
-    case 'eval': await cmdEval(ctx); break;
-
-    case 'break': await cmdBreak(ctx); break;
-
-    case 'close': await cmdClose(ctx); break;
-
-    // Commands below work on the live tab and leave it open.
-
-    case 'snapshot': await cmdSnapshot(ctx); break;
-
-    case 'click':
-    case 'type':
-    case 'fill':
-    case 'press': await cmdInteract(ctx); break;
-
-    case 'tabs': await cmdTabs(ctx); break;
-    case 'frames': await cmdFrames(ctx); break;
-    case 'status': await cmdStatus(ctx); break;
-    case 'step': await cmdStep(ctx); break;
-    case 'postmessage': await cmdPostMessage(ctx); break;
-    case 'replay': await cmdReplay(ctx); break;
-    case 'search-traffic': await cmdSearchTraffic(ctx); break;
-    case 'ws-search': await cmdWsSearch(ctx); break;
-    case 'inspect': await cmdInspect(ctx); break;
-    case 'workers': await cmdWorkers(ctx); break;
-    case 'purge': await cmdPurge(ctx); break;
-    case 'doctor': await cmdDoctor(ctx); break;
-    case 'resume': await cmdResume(ctx); break;
-    case 'goto': await cmdGoto(ctx); break;
-    case 'clean': await cmdClean(); break;
-    case 'click-at': await cmdClickAt(ctx); break;
-    case 'drag': await cmdDrag(ctx); break;
-    case 'wheel': await cmdWheel(ctx); break;
-    case 'key': await cmdKey(ctx); break;
-    case 'canvas': await cmdCanvas(ctx); break;
-    case 'wait': await cmdWait(ctx); break;
-
-    default:
-      console.error(`Unknown command: ${command}`);
-      console.log(HELP_TEXT);
-      throw new Error(`Unknown command: ${command}`);
+  const handler = COMMANDS[command];
+  if (!handler) {
+    console.error(`Unknown command: ${command}`);
+    console.log(HELP_TEXT);
+    throw new Error(`Unknown command: ${command}`);
   }
+  await handler(ctx);
 }
 
 module.exports = { expandEquals, redactRawText, redactHeaders, slimEntry, slimSocket, isHttpUrl };
