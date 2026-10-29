@@ -97,6 +97,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<Array<{ scriptId: string, startLine: number, lines: number, length: number | null, head: string | null, error?: string }>>}
    */
   async listDynamicScripts() {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     const rows = this.getScripts().filter((s) => !s.url);
     return Promise.all(rows.map(async (s) => {
       const base = { scriptId: s.scriptId, startLine: s.startLine, lines: s.endLine - s.startLine + 1, length: s.length ?? null };
@@ -121,6 +122,7 @@ class SourceController extends EventEmitter {
    * @param {number} [after] characters kept after it
    */
   async readAround(scriptIdOrUrl, lineNumber, columnNumber = 0, before = 200, after = 300) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     const { source, url, scriptId } = await this.getScriptSource(scriptIdOrUrl);
     const lines = source.split('\n');
     const line = lines[lineNumber];
@@ -147,6 +149,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<Array<{ lineNumber: number, column: number, lineContent: string }>>}
    */
   async findFunction(scriptIdOrUrl, name) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     if (!name) throw new TypeError('Function name must not be empty');
     const scriptId = this._resolveScriptId(scriptIdOrUrl);
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
@@ -206,6 +209,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<{ scriptId: string, url: string, source: string }>}
    */
   async getScriptSource(scriptIdOrUrl) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     const scriptId = this._resolveScriptId(scriptIdOrUrl);
     const meta = this._scripts.get(scriptId) || { scriptId, url: '' };
 
@@ -250,6 +254,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<Array<{ scriptId: string, url: string, matches: Array<{ lineNumber: number, lineContent: string }> }>>}
    */
   async searchInSources(query, options = {}) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     if (!query) throw new TypeError('Search query must not be empty');
 
     const isRegex = query instanceof RegExp;
@@ -290,6 +295,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<{ filePath: string, bytesWritten: number, url: string }>}
    */
   async downloadBundle(scriptIdOrUrl, outputPath) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     if (!outputPath) throw new TypeError('Output path is required');
 
     const { source, url } = await this.getScriptSource(scriptIdOrUrl);
@@ -312,6 +318,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<{ scriptId: string, url: string, code: string, bundle?: import('webcrack').WebcrackResult['bundle'] }>}
    */
   async deobfuscateBundle(scriptIdOrUrl, options = {}) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     const { source, url, scriptId } = await this.getScriptSource(scriptIdOrUrl);
     const result = await webcrack(source, options);
 
@@ -330,6 +337,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<{ scriptId: string, url: string, outputDirectory: string, moduleCount: number }>}
    */
   async unpackBundle(scriptIdOrUrl, outputDirectory, options = {}) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     if (!outputDirectory) throw new TypeError('Output directory is required');
 
     const { source, url, scriptId } = await this.getScriptSource(scriptIdOrUrl);
@@ -364,6 +372,7 @@ class SourceController extends EventEmitter {
    * @returns {Promise<Array<{ text: string, range: import('@ast-grep/napi').Range, metaMatches: Record<string, string> }>>}
    */
   async searchAst(scriptIdOrUrl, pattern, options = {}) {
+    await this.enable(); // enabled on demand: a page's own debugger statement cannot hang a command
     if (!pattern) throw new TypeError('AST pattern is required');
 
     let code;
