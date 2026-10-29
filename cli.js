@@ -1188,7 +1188,8 @@ async function cmdDoctor({ port }) {
   if (version) {
     try {
       const client = await attach(port);
-      const tabs = await client.browser.browserContexts().flatMap((c) => c.targets()).filter((t) => t.type() === 'page');
+      // browserContexts() is synchronous: the targets are already an array (javascript:S4123).
+      const tabs = client.browser.browserContexts().flatMap((c) => c.targets()).filter((t) => t.type() === 'page');
       add('tabs', tabs.length > 0, `${tabs.length} page target(s), attached to tab 0`);
       const page = await client.page.evaluate(() => ({ url: location.href, title: document.title, readyState: document.readyState, focused: document.hasFocus(), visible: document.visibilityState === 'visible' })).catch(() => null);
       add('page', Boolean(page), page ? `${page.url} - ${page.title} (${page.readyState}, focused=${page.focused}, visible=${page.visible})` : 'not readable (a busy renderer?)');
