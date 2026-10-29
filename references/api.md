@@ -310,6 +310,16 @@ For canvas games and iframes. Games draw on `<canvas>` inside an iframe, so the 
 | `clean` | Deletes the scratch folder `.tmp/` inside the skill |
 | `eval [url] <expression> [--frame U] [--file script.js]` | `--file` reads the expression from a file (use it instead of quoting in PowerShell). With `--frame`, waits up to the nav timeout for a frame whose URL contains `U`; a numeric index does not wait | With a URL: navigate, then evaluate — self-contained. Without: runs against the currently open tab and leaves it open, so follow-up `eval`s inherit page state (logins, SPA routes). Objects print as JSON, not `[object Object]` |
 
+| `step [url] <query> <line> [--trigger "<js>"] [--into\|--out] [--times N] [--eval expr]` | Pause once (breakpoint, or `--pause` for the running page), then step N times, reporting every stop (function, url, 1-based line/col, frame count) plus the final stack and `--eval` result. Stepping cannot be split across CLI calls: each call is its own CDP session and Chrome resumes on detach, so the breakpoint and trigger run inside this command |
+| `postmessage [url] [--wait S]` | Records `window.postMessage` traffic. The hook applies to documents created after it is installed, so pass a URL (no URL means it starts at the next navigation) |
+| `replay [url] <id\|url-part> [--wait S]` | Re-sends a recorded XHR/fetch through `Network.replayXHR` (same URL, headers, body) and lists the requests that appeared afterwards. Chrome refuses documents and sockets: the error says so |
+| `search-traffic [url] <text\|/re/> [--wait S]` | Finds a recorded request by url, post body, request headers, response headers or status line; returns `requestId`, `matchedFields` |
+| `ws-search [url] <text\|/re/> [--direction sent\|received] [--wait S]` | Searches WebSocket frames, decoding binary (msgpack/protobuf) payloads before matching, so a game's `updatePlayerInfo` is findable; each hit carries `bytes` and a printable `text` |
+| `inspect [url] <expression>` | Deep property dump through `Runtime.getProperties`: cycles, DOM nodes and functions are readable where `JSON.stringify` throws |
+| `workers` | Dedicated, service and shared workers with id, type and url |
+| `purge --cache --cookies` | `Network.clearBrowserCache` / `clearBrowserCookies` for the whole profile |
+| `status [--json]` | Chrome, tab, frame count, pause state, mirror progress. `--json` returns the same facts as data |
+
 Global flags: `--port <n>`, `--tab <n>` (attach to tab N instead of 0), `--json`, `--out <file>` (JSON-producing commands write to the file instead of stdout — parent dirs are created; stdout gets the path + size), `--version`, `--help`.
 
 A reply larger than 60 KB is written to `.tmp/results/result-<time>.json` and replaced by `{savedTo, bytes, keys, note}`, so a capture cannot flood an agent's context. `--out` chooses the path. `--flag=value` and `--flag value` parse identically.

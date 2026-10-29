@@ -1,8 +1,6 @@
 'use strict';
 
-// .default is the same object as the module (runtime-identical); the bare require loses its typings under NodeNext
-const puppeteer = require('puppeteer-extra').default;
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteer = require('puppeteer-core');
 const { PROTOCOL_TIMEOUT_MS, GOTO_TIMEOUT_MS, UNRESPONSIVE_WAIT_MS, CLEANUP_WAIT_MS } = require('./timeouts');
 const { settleWithin } = require('./util');
 
@@ -15,8 +13,6 @@ const WorkerController = require('./worker-controller');
 const DebugController = require('./debug-controller');
 const PerformanceController = require('./performance-controller');
 const VisualController = require('./visual-controller');
-
-puppeteer.use(StealthPlugin());
 
 /**
  * @typedef {{ dom: InstanceType<typeof DOMController>, network: InstanceType<typeof NetworkController>, websocket: InstanceType<typeof WebSocketController>, console: InstanceType<typeof ConsoleController>, sources: InstanceType<typeof SourceController>, debug: InstanceType<typeof DebugController>, performance: InstanceType<typeof PerformanceController>, visual: InstanceType<typeof VisualController> }} Controllers
@@ -102,8 +98,9 @@ class ChromeClient {
       // browser.pages() initializes every page, and initializing a page sends Network.enable, which a
       // blocked renderer never answers: one wedged tab would make every command fail. Listing targets
       // only reads target info, so initialize the one tab that was asked for, and only for a budget.
+      // Target[] is synchronous in puppeteer-core: awaiting it added nothing (javascript:S4123).
       /** @type {import('puppeteer-core').Target[]} */
-      const allTargets = await browser.targets();
+      const allTargets = browser.targets();
       const targets = allTargets.filter((target) => target.type() === 'page');
       const tab = options.tab ?? 0;
       if (tab >= targets.length) throw new Error(`Tab ${tab} does not exist: Chrome has ${targets.length} tab(s). List them with: node cli.js tabs`);

@@ -3,7 +3,11 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { connect, startChrome, waitUntil, checkCdpReady, DebugController } = require('./index');
+// Required on first use: --help, --version and clean must not pay ~340 ms for puppeteer.
+/** @returns {typeof import('./index')} */
+function core() {
+  return require('./index');
+}
 const T = require('./src/timeouts');
 const { spawn } = require('node:child_process');
 const { recordSite, createRun, activeRun, indexSite } = require('./src/site-mirror');
@@ -19,10 +23,10 @@ let tabIndex = 0; // set from --tab; every command attaches to this tab
  * @returns {Promise<Client>}
  */
 async function attach(port, /** @type {{ protocolTimeout?: number }} */ options = {}) {
-  if (!(await checkCdpReady(port))) {
+  if (!(await core().checkCdpReady(port))) {
     throw new Error(`Chrome is not running on port ${port}. Start it with: node cli.js start`);
   }
-  return connect({ port, autoLaunch: false, tab: tabIndex, ...options });
+  return core().connect({ port, autoLaunch: false, tab: tabIndex, ...options });
 }
 
 // A page blocked by a synchronous call cannot answer CDP, and the default wait is 30 s.
@@ -67,7 +71,7 @@ async function untilNotPaused(work) {
   clearTimeout(timer);
   if (first !== SLOW) return /** @type {T} */ (first);
   // A pause held by another live CLI command (its breakpoint is still waiting): name the stop point.
-  const held = DebugController.readPauseMarker();
+  const held = core().DebugController.readPauseMarker();
   if (held) throw new Error(`The page is paused in the debugger at ${held.url || held.scriptId}:${held.line} (${held.reason}), held by pid ${held.pid}. Resume it with: node cli.js resume`);
   return work;
 }
@@ -179,6 +183,23 @@ Interaction loop — operate the live tab one step at a time, like a person:
   frames                        List child iframes: index, canvas count, element count, url.
                                 --frame takes a substring of the url or this index
   status                        Is Chrome reachable on --port, and is a mirror recording running?
+  step [url] <query> <line> [--trigger "<js>"] [--into|--out] [--times N] [--eval expr]
+                                Pause once, then step N times, reporting each stop with its
+                                frames. Step across calls is impossible (each call is its own
+                                CDP session), so the breakpoint and trigger live here
+  step --pause [--times N]      Pause whatever is running now, then step
+  postmessage [url] [--wait S]  Record window.postMessage traffic (the hook applies to
+                                documents created after it, so pass a URL)
+  replay [url] <id|url-part>    Re-send a recorded XHR/fetch with Chrome's own replayXHR
+  search-traffic [url] <text|/re/>
+                                Find a recorded request by url, body or headers
+  ws-search [url] <text|/re/> [--direction sent|received]
+                                Find recorded WebSocket frames by payload
+  inspect [url] <expression>    Deep property dump (cycles, DOM nodes, functions)
+  workers                       Dedicated/service/shared workers and their URLs
+  purge --cache --cookies       Delete the browser cache and/or the profile's cookies
+  mirror-run <url> <runDir>     Record a page into a mirror run directory (internal: used by
+                                mirror's worker; records every request, response and lazy load)
   clean                         Delete the scratch folder .tmp/ inside the skill (this also deletes
                                 mirror runs and anything else under .tmp/; copy what you need first)
   click-at <x> <y> [--frame U] [--canvas] [--index N] [--button left|right|middle]
@@ -310,7 +331,7 @@ async function release(client) {
 
 /** @param {Ctx} ctx */
 async function cmdStart({ port }) {
-  await startChrome({ port });
+  await core().startChrome({ port });
 }
 
 /** @param {Ctx} ctx */
@@ -427,7 +448,7 @@ async function cmdMirror({ args, port, tab }) {
     const dir = activeRun(outRoot(args[2]));
     if (!dir) throw new Error('No active recording. Start one with: node cli.js mirror start <url>');
     fs.writeFileSync(path.join(dir, 'STOP'), '');
-    await waitUntil(() => fs.existsSync(path.join(dir, 'manifest.json')), { timeout: 120000, every: 500 });
+    await core().waitUntil(() => fs.existsSync(path.join(dir, 'manifest.json')), { timeout: 120000, every: 500 });
     if (!fs.existsSync(path.join(dir, 'manifest.json'))) throw new Error(`Recorder did not finish. See ${dir}/recorder.log`);
     const m = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
     console.log(`Stopped. ${m.files.length} resources saved, ${m.failed.length} failed, ${m.redirects} redirects -> ${dir}`);
@@ -442,7 +463,7 @@ async function cmdMirror({ args, port, tab }) {
   const root = outRoot(args[3]);
   const busy = activeRun(root);
   if (busy) throw new Error(`Already recording into ${busy}. Stop it first: node cli.js mirror stop`);
-  if (!(await checkCdpReady(port))) throw new Error(`Chrome is not running on port ${port}. Start it with: node cli.js start`);
+  if (!(await core().checkCdpReady(port))) throw new Error(`Chrome is not running on port ${port}. Start it with: node cli.js start`);
 
   const runDir = createRun(root, url);
   const logFd = fs.openSync(path.join(runDir, 'recorder.log'), 'a');
@@ -454,7 +475,7 @@ async function cmdMirror({ args, port, tab }) {
   child.unref();
   fs.writeFileSync(path.join(runDir, 'recorder.pid'), String(child.pid));
 
-  await waitUntil(() => fs.existsSync(path.join(runDir, 'READY')), { timeout: 30000, every: 200 });
+  await core().waitUntil(() => fs.existsSync(path.join(runDir, 'READY')), { timeout: 30000, every: 200 });
   if (!fs.existsSync(path.join(runDir, 'READY'))) throw new Error(`Recorder did not start. See ${runDir}/recorder.log`);
   console.log(`Recording ${url} -> ${runDir}\nInteract with the tab now. Stop with: node cli.js mirror stop`);
 }
@@ -502,7 +523,7 @@ async function captureTraffic(client, url, waitSecs) {
   // networkidle2 does not count WebSocket handshakes. If the page opened
   // a WS, wait for its first frame (marker-based, no guessed sleep) —
   // capped at 8s. --wait adds a plain dwell on top for late frames.
-  await waitUntil(() => {
+  await core().waitUntil(() => {
     const socks = client.websocket.getSockets();
     return socks.length === 0 || socks.some((s) => s.frames.length > 0);
   }, { timeout: T.CLI_WS_WAIT_MS });
@@ -828,6 +849,7 @@ async function cmdBreak({ args, port, outFile }) {
   const client = (activeClient = await attach(port));
   if (o.url) await client.goto(o.url);
   await client.debug.enable({ pauseOnExceptions: o.pauseExc });
+  await client.sources.enable();
   const { bp, targetUrl, matchedScripts } = await setScriptBreakpoint(client, o.scriptQuery, o.line, o.col, o.condition);
 
   // Runs the action in this same session, so the pause lands on this breakpoint. Not awaited: the page
@@ -974,39 +996,44 @@ async function cmdFrames({ port, outFile }) {
 }
 
 /** @param {Ctx} ctx */
-async function cmdStatus({ port }) {
-  if (await checkCdpReady(port)) {
-    console.log(`Chrome: running on port ${port}`);
-    // Where the tab is and whether a command holds a pause, so a stalled run can be checked without a new action.
-    const paused = DebugController.readPauseMarker() ? 'yes (node cli.js resume)' : 'no';
+async function cmdStatus({ port, isJson, outFile }) {
+  /** @type {{ chrome: boolean, port: number, url?: string, title?: string | null, frames?: number, paused: string | null, mirror: string | null, responses?: number, idleSeconds?: string }} */
+  const info = { chrome: Boolean(await core().checkCdpReady(port)), port, paused: core().DebugController.readPauseMarker() ? 'yes (node cli.js resume)' : null, mirror: null };
+  if (info.chrome) {
     const client = await attach(port).catch((error) => {
       // A blocked renderer answers no page commands at all, so report that instead of failing the health check.
       if (!(error instanceof Error && error.name === 'UnresponsiveTabError')) throw error;
-      console.log(error.message);
-      console.log(`Paused: ${paused}`);
+      info.url = '(not answering: the renderer is blocked)';
+      console.error(error.message);
       return null;
     });
     if (client) {
       activeClient = client;
+      info.url = client.url();
       // Bounded: on a blocked renderer the title never arrives, and status must still report the tab.
-      const title = await settleWithin(client.title(), T.UNRESPONSIVE_WAIT_MS, 'reading the tab title');
-      console.log(`Tab: ${client.url()} | ${title ?? '(no answer: the renderer is blocked)'}`);
-      console.log(`Frames: ${client.visual.frames().length} | Paused: ${paused}`);
+      info.title = (await settleWithin(client.title(), T.UNRESPONSIVE_WAIT_MS, 'reading the tab title')) ?? null;
+      info.frames = client.visual.frames().length;
       await release(client);
     }
-  } else {
-    console.log(`Chrome: not running on port ${port} (start it with: node cli.js start)`);
   }
   const recording = activeRun(path.join(__dirname, '.tmp', 'mirror'));
-  if (!recording) {
-    console.log('Mirror recording: none');
+  if (recording) {
+    const log = path.join(recording, 'requests.jsonl');
+    info.mirror = recording;
+    info.responses = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.includes('"kind":"response"')).length : 0;
+    info.idleSeconds = fs.existsSync(log) ? ((Date.now() - fs.statSync(log).mtimeMs) / 1000).toFixed(1) : '?';
+  }
+  if (isJson || outFile) {
+    await emit(info, outFile);
     return;
   }
-  // Progress without touching the recorder: responses saved so far, and how long since the last write.
-  const log = path.join(recording, 'requests.jsonl');
-  const saved = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.includes('"kind":"response"')).length : 0;
-  const idle = fs.existsSync(log) ? ((Date.now() - fs.statSync(log).mtimeMs) / 1000).toFixed(1) : '?';
-  console.log(`Mirror recording: ${recording} (${saved} responses saved, last write ${idle}s ago)`);
+  if (!info.chrome) console.log(`Chrome: not running on port ${port} (start it with: node cli.js start)`);
+  else {
+    console.log(`Chrome: running on port ${port}`);
+    if (info.url) console.log(`Tab: ${info.url} | ${info.title ?? '(no answer: the renderer is blocked)'}`);
+    console.log(`Frames: ${info.frames ?? 0} | Paused: ${info.paused ? 'yes (node cli.js resume)' : 'no'}`);
+  }
+  console.log(info.mirror ? `Mirror recording: ${info.mirror} (${info.responses} responses saved, last write ${info.idleSeconds}s ago)` : 'Mirror recording: none');
 }
 
 /**
@@ -1052,7 +1079,13 @@ async function cmdRaw({ args, port, outFile }) {
   if (!query) throw new Error('raw needs a request: raw [url] <requestId|url-substring> [--response] [--wait S]');
   const client = (activeClient = await attach(port));
   await settleCapture(client, url, wait);
-  const text = response ? await client.network.toRawResponse(query) : await client.network.toRawRequest(query);
+  /** @type {string} */
+  let text;
+  try {
+    text = response ? await client.network.toRawResponse(query) : await client.network.toRawRequest(query);
+  } catch (error) {
+    throw new Error(`${messageOf(error).split('\n')[0]}. Nothing was recorded in this process: pass a URL and --wait, e.g. node cli.js raw https://target/ "<url-part>" --wait 2`);
+  }
   if (outFile) {
     const abs = path.resolve(outFile);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
@@ -1150,18 +1183,19 @@ async function cmdDoctor({ port }) {
   const checks = [];
   const add = (/** @type {string} */ check, /** @type {boolean} */ ok, /** @type {string} */ detail = '') => checks.push({ check, ok, detail });
   add('node', Number(process.versions.node.split('.')[0]) >= 20, process.version);
-  const version = await checkCdpReady(port);
+  const version = await core().checkCdpReady(port);
   add('chrome', Boolean(version), version ? `${version.Browser} on port ${port}` : `not reachable on port ${port} (run: node cli.js start)`);
   if (version) {
     try {
       const client = await attach(port);
-      const tabs = await client.browser.browserContexts().flatMap((c) => c.targets()).filter((t) => t.type() === 'page');
+      // browserContexts() is synchronous: the targets are already an array (javascript:S4123).
+      const tabs = client.browser.browserContexts().flatMap((c) => c.targets()).filter((t) => t.type() === 'page');
       add('tabs', tabs.length > 0, `${tabs.length} page target(s), attached to tab 0`);
       const page = await client.page.evaluate(() => ({ url: location.href, title: document.title, readyState: document.readyState, focused: document.hasFocus(), visible: document.visibilityState === 'visible' })).catch(() => null);
       add('page', Boolean(page), page ? `${page.url} - ${page.title} (${page.readyState}, focused=${page.focused}, visible=${page.visible})` : 'not readable (a busy renderer?)');
       const errors = client.console.getLogs({ type: 'error' }).length;
       add('console', true, `${errors} recorded error(s) in this session`);
-      const paused = DebugController.readPauseMarker();
+      const paused = core().DebugController.readPauseMarker();
       add('debugger', !paused, paused ? `paused at ${paused.url || paused.scriptId}:${paused.line} (pid ${paused.pid}) - run: node cli.js resume` : 'no pause held');
       await release(client);
     } catch (error) {
@@ -1176,6 +1210,249 @@ async function cmdDoctor({ port }) {
   add('workspace', true, fs.existsSync(tmpDir) ? `.tmp present (${fs.readdirSync(tmpDir).length} entries)` : '.tmp missing (created on demand)');
   console.log(JSON.stringify({ ok: checks.every((c) => c.ok), version: pkg.version, port, checks }, null, 2));
   if (!checks.every((c) => c.ok)) process.exitCode = 1;
+}
+
+/** Waits for the next Debugger.paused, ignoring any pause already held (a step resumes first). */
+/** @param {Client} client @param {number} timeoutS */
+function waitNextPause(client, timeoutS) {
+  return new Promise((resolve) => {
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let timer;
+    const onPause = (/** @type {unknown} */ event) => {
+      clearTimeout(timer);
+      resolve(event);
+    };
+    client.debug.once('paused', onPause);
+    timer = setTimeout(() => {
+      client.debug.off('paused', onPause);
+      resolve(null);
+    }, timeoutS * 1000);
+  });
+}
+
+/**
+ * One pause, N steps, one report. A CLI call is one CDP session and Chrome resumes a paused page when the
+ * session detaches, so stepping cannot be split across calls: the breakpoint, the trigger, the steps and the
+ * reads all happen here (like `break --eval`, but repeated).
+ * @param {Ctx} ctx
+ */
+async function cmdStep({ args, port, outFile }) {
+  const direction = args.includes('--into') ? 'into' : args.includes('--out') ? 'out' : 'over';
+  const pauseNow = args.includes('--pause');
+  for (const flag of ['--into', '--out', '--pause']) {
+    if (args.includes(flag)) args.splice(0, args.length, ...args.filter((a) => a !== flag));
+  }
+  const times = Number(takeFlag(args, '--times') ?? 1);
+  if (!Number.isInteger(times) || times < 1 || times > 50) throw new Error('--times expects 1-50, e.g. --times 5');
+  const evalExpr = takeFlag(args, '--eval');
+  const timeoutS = Number(takeFlag(args, '--timeout') ?? 10);
+  const o = pauseNow ? null : parseBreakArgs(args);
+
+  const client = (activeClient = await attach(port));
+  if (o?.url) await client.goto(o.url);
+  await client.debug.enable({ pauseOnExceptions: o?.pauseExc });
+  // The script map is the debugger's; enabling it here keeps the mask and the frame URLs working.
+  await client.sources.enable();
+
+  let hit = null;
+  let start = {};
+  if (pauseNow) {
+    const paused = waitNextPause(client, timeoutS);
+    await client.debug.pause();
+    hit = await paused;
+    start = { mode: 'pause' };
+  } else if (o) {
+    const { bp, targetUrl, matchedScripts } = await setScriptBreakpoint(client, o.scriptQuery, o.line, o.col, o.condition);
+    start = { targetUrl, line: o.line, column: o.col, locations: bp.locations, matchedScripts };
+    if (o.trigger) client.evaluate(o.trigger).catch((/** @type {unknown} */ err) => console.error(`trigger failed: ${messageOf(err)}`));
+    hit = await waitForPause(client, o.timeoutS);
+  }
+  if (!hit) {
+    await emit({ ...start, hit: false, note: `no pause within ${timeoutS}s, so there was nothing to step. Arm it with --trigger "<js>" (a breakpoint only fires while this command is attached).` }, outFile);
+    await release(client);
+    return;
+  }
+
+  /** @type {Array<{ step: number, functionName: string, url: string, line: number, column: number, frames: number, note?: string }>} */
+  const stops = [];
+  const describe = (/** @type {any} */ event) => {
+    const frames = describeFrames(client, event);
+    const top = frames[0] || { functionName: '(none)', url: '', lineNumber: -1, columnNumber: -1 };
+    return { functionName: top.functionName, url: top.url, line: (top.lineNumber ?? -1) + 1, column: (top.columnNumber ?? 0) + 1, frames: frames.length };
+  };
+  stops.push({ step: 0, ...describe(hit), note: 'entry' });
+
+  for (let i = 1; i <= times; i++) {
+    const next = waitNextPause(client, timeoutS);
+    const stepFn = direction === 'into' ? () => client.debug.stepInto() : direction === 'out' ? () => client.debug.stepOut() : () => client.debug.stepOver();
+    await stepFn();
+    const event = await next;
+    if (!event) {
+      stops.push({ step: i, functionName: '(no pause)', url: '', line: -1, column: -1, frames: 0, note: `the page did not pause again within ${timeoutS}s (the frame returned, or execution left the script)` });
+      break;
+    }
+    hit = event;
+    stops.push({ step: i, ...describe(event) });
+  }
+
+  const frames = describeFrames(client, hit);
+  let evalResult = null;
+  if (evalExpr && frames.length) evalResult = await evaluateOnTop(client, frames[0].callFrameId, evalExpr);
+  await emit({
+    ...start,
+    hit: true,
+    direction,
+    steps: stops.length - 1,
+    stops,
+    callFrames: frames,
+    ...(evalResult !== null ? { eval: evalResult } : {}),
+    resumed: true,
+  }, outFile);
+  try { await client.debug.resume(); } catch {}
+  await release(client);
+}
+
+/**
+ * Records window.postMessage traffic. The hook is installed for documents created after this call, so a URL
+ * is what makes it catch anything; without one it applies from the next navigation.
+ * @param {Ctx} ctx
+ */
+async function cmdPostMessage({ args, port, outFile }) {
+  const wait = Number(takeFlag(args, '--wait') ?? 3);
+  const limit = Number(takeFlag(args, '--limit') ?? 50);
+  const client = (activeClient = await attach(port));
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  await client.dom.hookPostMessage();
+  if (url) await client.goto(url, { waitUntil: 'networkidle2', timeout: T.CLI_NAV_TIMEOUT_MS });
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait * 1000));
+  const logs = await client.dom.getPostMessageLogs();
+  await emit({
+    url: client.url(),
+    count: logs.length,
+    ...(url ? {} : { note: 'no URL given: the hook only sees documents created after it was installed, so navigate in the same command (postmessage <url>)' }),
+    messages: logs.slice(-limit),
+  }, outFile);
+  await release(client);
+}
+
+/** Re-sends a recorded XHR/fetch with Chrome's own Network.replayXHR: same URL, headers and body. */
+/** @param {Ctx} ctx */
+async function cmdReplay({ args, port, outFile }) {
+  const wait = Number(takeFlag(args, '--wait') ?? 2);
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
+  if (!query) throw new Error('replay needs a request: replay [url] <requestId|url-substring> [--wait S]');
+  const client = (activeClient = await attach(port));
+  await settleCapture(client, url, url ? wait : 0.5);
+  const before = client.network.getTraffic().length;
+  /** @type {string} */
+  let errorText = '';
+  try {
+    await client.network.replayXHR(query);
+  } catch (error) {
+    errorText = messageOf(error);
+    // Chrome only replays XHR and fetch; a document or a socket cannot be re-sent this way.
+    if (/correspond to XHR/i.test(errorText)) errorText += ' (Network.replayXHR only accepts XHR/Fetch requests: pick one from `traffic --json`, which lists resourceType)';
+  }
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait * 1000));
+  const fresh = client.network.getTraffic().slice(before);
+  await emit({
+    replayed: query,
+    ok: !errorText,
+    ...(errorText ? { error: errorText.split('\n')[0] } : {}),
+    newRequests: fresh.map((entry) => slimEntry(entry, true)),
+  }, outFile);
+  await release(client);
+}
+
+/** Finds a recorded request by URL, body, request headers, response headers or status line. */
+/** @param {Ctx} ctx */
+async function cmdSearchTraffic({ args, port, outFile }) {
+  const wait = Number(takeFlag(args, '--wait') ?? 1.5);
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
+  if (!query) throw new Error('search-traffic needs a query: search-traffic [url] <text|/regex/> [--wait S]');
+  const client = (activeClient = await attach(port));
+  await settleCapture(client, url, wait);
+  const matches = client.network.searchTraffic(query);
+  await emit({
+    query,
+    count: matches.length,
+    matches: matches.map((m) => ({ requestId: m.requestId, url: m.url, method: m.method, status: m.status, matchedFields: m.matchedFields })),
+  }, outFile);
+  await release(client);
+}
+
+/** Search WebSocket frames by payload text or JSON value. */
+/** @param {Ctx} ctx */
+async function cmdWsSearch({ args, port, outFile }) {
+  const direction = takeFlag(args, '--direction');
+  if (direction && direction !== 'sent' && direction !== 'received') throw new Error('--direction must be sent or received');
+  const wait = Number(takeFlag(args, '--wait') ?? 3);
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  const query = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
+  if (!query) throw new Error('ws-search needs a query: ws-search [url] <text|/regex/> [--direction sent|received] [--wait S]');
+  const client = (activeClient = await attach(port));
+  await settleCapture(client, url, wait);
+  // A game speaks msgpack/protobuf: the payload is base64, so a text query has to look at the decoded
+  // bytes, otherwise "updatePlayerInfo" never matches however many frames arrive.
+  const re = typeof query === 'string' && /^\/(.+)\/([gimsuy]*)$/s.exec(query);
+  const needle = re ? new RegExp(re[1], re[2]) : null;
+  const matchesQueryLocal = (/** @type {string} */ text) => (needle ? needle.test(text) : text.toLowerCase().includes(String(query).toLowerCase()));
+  const matches = client.websocket
+    .getFrames(undefined, { direction: /** @type {'sent' | 'received' | undefined} */ (direction ?? undefined) })
+    .filter((frame) => {
+      const text = frame.isBinary ? Buffer.from(frame.payloadData, 'base64').toString('utf8') : frame.payloadData;
+      return matchesQueryLocal(text) || (frame.parsedJson ? matchesQueryLocal(JSON.stringify(frame.parsedJson)) : false);
+    });
+  await emit({
+    query,
+    count: matches.length,
+    frames: matches.slice(0, 50).map((frame) => ({
+      socket: frame.url,
+      direction: frame.direction,
+      opcode: frame.opcode,
+      binary: frame.isBinary || undefined,
+      bytes: frame.isBinary ? Buffer.from(frame.payloadData, 'base64').length : Buffer.byteLength(frame.payloadData),
+      payload: frame.payloadData.slice(0, 500),
+      text: frame.isBinary ? Buffer.from(frame.payloadData, 'base64').toString('utf8').replace(/[^ -~]/g, '.') : undefined,
+      at: frame.wallTime,
+    })),
+  }, outFile);
+  await release(client);
+}
+
+/** Deep property dump of an object id or expression; survives cycles, DOM nodes and functions. */
+/** @param {Ctx} ctx */
+async function cmdInspect({ args, port, outFile }) {
+  const url = args[1] && isHttpUrl(args[1]) ? args[1] : null;
+  const expression = args.slice(url ? 2 : 1).filter((a) => !a.startsWith('--')).join(' ');
+  if (!expression) throw new Error('inspect needs an expression: inspect [url] <expression|objectId>');
+  const client = (activeClient = await attach(port));
+  if (url) await client.goto(url, { waitUntil: 'networkidle2', timeout: T.CLI_NAV_TIMEOUT_MS });
+  const result = await client.console.inspectObject(expression);
+  await emit({ expression, result }, outFile);
+  await release(client);
+}
+
+/** Lists dedicated workers, service workers and shared workers with their URLs. @param {Ctx} ctx */
+async function cmdWorkers({ port, outFile }) {
+  const client = (activeClient = await attach(port));
+  const list = client.workers ? client.workers.list() : [];
+  await emit({ count: list.length, workers: list }, outFile);
+  await release(client);
+}
+
+/** Deletes the browser cache and/or cookies for the whole profile. @param {Ctx} ctx */
+async function cmdPurge({ args, port, outFile }) {
+  const cache = args.includes('--cache');
+  const cookies = args.includes('--cookies');
+  if (!cache && !cookies) throw new Error('purge needs --cache and/or --cookies: purge --cache --cookies');
+  const client = (activeClient = await attach(port));
+  if (cache) await client.network.clearCache();
+  if (cookies) await client.network.clearCookies();
+  await emit({ ok: true, cleared: { cache, cookies } }, outFile);
+  await release(client);
 }
 
 async function cmdClean() {
@@ -1195,7 +1472,10 @@ async function cmdClean() {
 async function resolveCanvasIndex(client, frame, requested) {
   if (requested !== null) return requested;
   const list = await client.visual.listCanvases({ frame: frame ?? undefined });
-  if (!list.length) throw new Error(`No <canvas> ${frame ? `in frame "${frame}"` : 'on the page'}. Run: node cli.js canvas --list`);
+  if (!list.length) {
+    const where = frame ? `in frame "${frame}"` : 'on the page';
+    throw new Error(`No <canvas> ${where}. Run: node cli.js canvas --list`);
+  }
   const visible = list.filter((c) => c.visible);
   const pool = visible.length ? visible : list;
   pool.sort((a, b) => b.width * b.height - a.width * a.height);
@@ -1256,7 +1536,7 @@ async function cmdClickAt({ args, port, outFile }) {
 /** @param {Client} client @param {string | null} frame */
 async function waitForFrame(client, frame) {
   if (!frame || /^\d+$/.test(frame)) return; // an index is used as-is: it does not wait
-  const found = await waitUntil(() => client.visual.frames().some((f) => f.url().includes(frame)), { timeout: T.CLI_NAV_TIMEOUT_MS });
+  const found = await core().waitUntil(() => client.visual.frames().some((f) => f.url().includes(frame)), { timeout: T.CLI_NAV_TIMEOUT_MS });
   if (!found) {
     const seen = client.visual.frames().map((f) => f.url().slice(0, 100)).join('\n  ');
     throw new Error(`Waited ${T.CLI_NAV_TIMEOUT_MS / 1000}s for a frame whose URL contains "${frame}". Frames seen:\n  ${seen}`);
@@ -1353,7 +1633,7 @@ async function waitForStableCanvas(client, frame, index) {
     return c ? `${c.width}x${c.height}` : '';
   }, index);
   let previous = await sample();
-  return waitUntil(async () => {
+  return core().waitUntil(async () => {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const current = await sample();
     const stable = Boolean(current) && current === previous;
@@ -1414,11 +1694,13 @@ async function cmdCanvas({ args, port, outFile }) {
     const started = Date.now();
     let last = null;
     for (let i = 1; i <= total; i++) {
-      const shot = await client.visual.canvasScreenshot({ frame: frame ?? undefined, index: canvasIndex });
+      // A recording is a timed sequence: each frame is captured, then the loop waits for the next slot.
+      // Promise.all would capture N frames at once, all with the same timestamp.
+      const shot = await client.visual.canvasScreenshot({ frame: frame ?? undefined, index: canvasIndex }); // NOSONAR S9382
       fs.writeFileSync(path.join(dir, `f${String(i).padStart(4, '0')}.png`), shot.buffer);
       last = shot;
       const wait = started + (i * 1000) / fps - Date.now();
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait)); // NOSONAR S9382
     }
     console.log(JSON.stringify({ ok: true, action: 'canvas-record', dir, frames: total, fps, seconds, width: last?.width, height: last?.height, canvasIndex, owner }, null, 2));
     await release(client);
@@ -1661,7 +1943,7 @@ async function cmdGoto({ args, port }) {
 
 /** Resumes the page if a live CLI command holds a pause on it. @param {Ctx} ctx */
 async function cmdResume({ port }) {
-  const held = DebugController.readPauseMarker();
+  const held = core().DebugController.readPauseMarker();
   if (!held) {
     console.log('The page is not paused.');
     return;
@@ -1669,7 +1951,7 @@ async function cmdResume({ port }) {
   const client = (activeClient = await attach(port));
   await client.cdp.send('Debugger.enable').catch(() => {});
   await client.cdp.send('Debugger.resume');
-  DebugController.clearPauseMarker({ force: true });
+  core().DebugController.clearPauseMarker({ force: true });
   console.log(`Resumed. It was paused at ${held.url || held.scriptId}:${held.line} (${held.reason}), held by pid ${held.pid}.`);
   await release(client);
 }
@@ -1693,6 +1975,69 @@ function expandEquals(argv) {
     return m ? [`--${m[1]}`, m[2]] : [arg];
   });
 }
+
+/**
+ * Command table: one lookup instead of a 52-case switch. The handlers are function declarations, so they are
+ * hoisted and this literal can sit above main().
+ * @type {Record<string, (ctx: Ctx) => Promise<unknown>>}
+ */
+const COMMANDS = {
+  'start': cmdStart,
+  'dump-forms': cmdDumpForms,
+  'dump-storage': cmdDumpStorage,
+  'listeners': cmdListeners,
+  'search-sources': cmdSearchSources,
+  'download-bundle': cmdDownloadBundle,
+  'deobfuscate': cmdDeobfuscate,
+  'unpack': cmdUnpack,
+  'ast-search': cmdAstSearch,
+  'vm-scripts': cmdVmScripts,
+  'find-function': cmdFindFunction,
+  'snippet': cmdSnippet,
+  'layout': cmdLayout,
+  'catch-script': cmdCatchScript,
+  'events': cmdEvents,
+  'profile': cmdProfile,
+  'mirror': cmdMirror,
+  'mirror-run': cmdMirrorRun,
+  'index-site': cmdIndexSite,
+  'traffic': cmdTraffic,
+  'console': cmdConsole,
+  'raw': cmdRaw,
+  'search-bodies': cmdSearchBodies,
+  'ws-frames': cmdWsFrames,
+  'globals': cmdGlobals,
+  'objects': cmdObjects,
+  'eval': cmdEval,
+  'break': cmdBreak,
+  'close': cmdClose,
+  'snapshot': cmdSnapshot,
+  'click': cmdInteract,
+  'type': cmdInteract,
+  'fill': cmdInteract,
+  'press': cmdInteract,
+  'tabs': cmdTabs,
+  'frames': cmdFrames,
+  'status': cmdStatus,
+  'step': cmdStep,
+  'postmessage': cmdPostMessage,
+  'replay': cmdReplay,
+  'search-traffic': cmdSearchTraffic,
+  'ws-search': cmdWsSearch,
+  'inspect': cmdInspect,
+  'workers': cmdWorkers,
+  'purge': cmdPurge,
+  'doctor': cmdDoctor,
+  'resume': cmdResume,
+  'goto': cmdGoto,
+  'click-at': cmdClickAt,
+  'drag': cmdDrag,
+  'wheel': cmdWheel,
+  'key': cmdKey,
+  'canvas': cmdCanvas,
+  'wait': cmdWait,
+  'clean': cmdClean,
+};
 
 async function main() {
   const argv = expandEquals(process.argv.slice(2));
@@ -1726,80 +2071,18 @@ async function main() {
     }));
   }
 
-  switch (command) {
-    case 'start': await cmdStart(ctx); break;
-
-    case 'dump-forms': await cmdDumpForms(ctx); break;
-
-    case 'dump-storage': await cmdDumpStorage(ctx); break;
-
-    case 'listeners': await cmdListeners(ctx); break;
-
-    case 'search-sources': await cmdSearchSources(ctx); break;
-
-    case 'download-bundle': await cmdDownloadBundle(ctx); break;
-
-    case 'deobfuscate': await cmdDeobfuscate(ctx); break;
-
-    case 'unpack': await cmdUnpack(ctx); break;
-
-    case 'ast-search': await cmdAstSearch(ctx); break;
-    case 'vm-scripts': await cmdVmScripts(ctx); break;
-    case 'find-function': await cmdFindFunction(ctx); break;
-    case 'snippet': await cmdSnippet(ctx); break;
-    case 'layout': await cmdLayout(ctx); break;
-    case 'catch-script': await cmdCatchScript(ctx); break;
-    case 'events': await cmdEvents(ctx); break;
-    case 'profile': await cmdProfile(ctx); break;
-
-    case 'mirror': await cmdMirror(ctx); break;
-    case 'mirror-run': await cmdMirrorRun(ctx); break;
-    case 'index-site': await cmdIndexSite(ctx); break;
-    case 'traffic': await cmdTraffic(ctx); break;
-    case 'console': await cmdConsole(ctx); break;
-    case 'raw': await cmdRaw(ctx); break;
-    case 'search-bodies': await cmdSearchBodies(ctx); break;
-    case 'ws-frames': await cmdWsFrames(ctx); break;
-    case 'globals': await cmdGlobals(ctx); break;
-    case 'objects': await cmdObjects(ctx); break;
-
-    case 'eval': await cmdEval(ctx); break;
-
-    case 'break': await cmdBreak(ctx); break;
-
-    case 'close': await cmdClose(ctx); break;
-
-    // Commands below work on the live tab and leave it open.
-
-    case 'snapshot': await cmdSnapshot(ctx); break;
-
-    case 'click':
-    case 'type':
-    case 'fill':
-    case 'press': await cmdInteract(ctx); break;
-
-    case 'tabs': await cmdTabs(ctx); break;
-    case 'frames': await cmdFrames(ctx); break;
-    case 'status': await cmdStatus(ctx); break;
-    case 'doctor': await cmdDoctor(ctx); break;
-    case 'resume': await cmdResume(ctx); break;
-    case 'goto': await cmdGoto(ctx); break;
-    case 'clean': await cmdClean(); break;
-    case 'click-at': await cmdClickAt(ctx); break;
-    case 'drag': await cmdDrag(ctx); break;
-    case 'wheel': await cmdWheel(ctx); break;
-    case 'key': await cmdKey(ctx); break;
-    case 'canvas': await cmdCanvas(ctx); break;
-    case 'wait': await cmdWait(ctx); break;
-
-    default:
-      console.error(`Unknown command: ${command}`);
-      console.log(HELP_TEXT);
-      throw new Error(`Unknown command: ${command}`);
+  const handler = COMMANDS[command];
+  if (!handler) {
+    console.error(`Unknown command: ${command}`);
+    console.log(HELP_TEXT);
+    throw new Error(`Unknown command: ${command}`);
   }
+  await handler(ctx);
 }
 
-main()
+module.exports = { expandEquals, redactRawText, redactHeaders, slimEntry, slimSocket, isHttpUrl };
+
+if (require.main === module) main()
   .catch((err) => {
     console.error(`[Error] ${err.message}`);
     // A blocked renderer (for example a synchronous XMLHttpRequest) never answers CDP, so the call times out.

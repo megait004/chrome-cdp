@@ -215,16 +215,23 @@ class DebugController extends EventEmitter {
    */
   async getScopeValues(callFrame, options = {}) {
     const limit = options.limit ?? 40;
+    // Each scope is an independent Runtime.getProperties call, and they are read while the page is paused:
+    // run them together and pair the results by index, which keeps scope-chain order in the output.
+    const scopes = (callFrame.scopeChain ?? []).filter((scope) => {
+      if (!options.includeGlobals && (scope.type === 'global' || scope.type === 'with')) return false;
+      return Boolean(scope.object?.objectId);
+    });
+    const properties = await Promise.all(scopes.map((scope) => this._cdp.send('Runtime.getProperties', {
+      objectId: /** @type {string} */ (scope.object?.objectId),
+      ownProperties: true,
+    })));
+    /** @type {Array<{ scope: string, name: string, value: string, chars?: number }>} */
     const values = [];
-    for (const scope of callFrame.scopeChain ?? []) {
-      if (!options.includeGlobals && (scope.type === 'global' || scope.type === 'with')) continue;
-      const objectId = scope.object?.objectId;
-      if (!objectId) continue;
-      const properties = await this._cdp.send('Runtime.getProperties', { objectId, ownProperties: true });
-      for (const property of properties.result.slice(0, limit)) {
+    scopes.forEach((scope, index) => {
+      for (const property of properties[index].result.slice(0, limit)) {
         values.push({ scope: scope.type, name: property.name, ...describeRemote(property.value) });
       }
-    }
+    });
     return values;
   }
   pause() { return this._cdp.send('Debugger.pause'); }

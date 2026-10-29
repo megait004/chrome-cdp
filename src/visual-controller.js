@@ -159,10 +159,12 @@ class VisualController {
     await sleep(50);
     await this._mouse('mousePressed', start, { button, buttons: pressed, clickCount: 1 });
     await sleep(60);
+    // Sequential by design: a game samples the pointer once per frame, so the moves have to arrive in order and
+    // spread over time. Promise.all would collapse the drag into one teleport, which most games ignore.
     for (let i = 1; i <= steps; i++) {
       const at = { x: start.x + (end.x - start.x) * (i / steps), y: start.y + (end.y - start.y) * (i / steps) };
-      await this._mouse('mouseMoved', at, { button: 'none', buttons: pressed });
-      if (stepMs > 0) await sleep(stepMs);
+      await this._mouse('mouseMoved', at, { button: 'none', buttons: pressed }); // NOSONAR S9382
+      if (stepMs > 0) await sleep(stepMs); // NOSONAR S9382
     }
     await sleep(60);
     await this._mouse('mouseReleased', end, { button, buttons: 0, clickCount: 1 });
@@ -202,9 +204,11 @@ class VisualController {
   async key(codes, { holdMs = 0, settle = false } = {}) {
     const list = Array.isArray(codes) ? codes : [codes];
     await this.prepareInput({ settle });
-    for (const code of list) await this._cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...this._keyBase(code) });
+    // Sequential by design: a chord is an order, not a batch. Every key must go down before any comes up,
+    // and the releases run in reverse, so the page sees the same sequence a person would produce.
+    for (const code of list) await this._cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...this._keyBase(code) }); // NOSONAR S9382
     if (holdMs > 0) await sleep(holdMs);
-    for (const code of [...list].reverse()) await this._cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...this._keyBase(code) });
+    for (const code of [...list].reverse()) await this._cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...this._keyBase(code) }); // NOSONAR S9382
   }
 
   /**
