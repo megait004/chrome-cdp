@@ -73,7 +73,6 @@ Usage: node cli.js <command> [options] [arguments]
 
 Commands:
   start                         Start Chrome with remote debugging on port 9222
-  markdown [url] [destFile]     Extract article content as clean Markdown (GFM)
   dump-forms [url]              Audit all forms, methods, actions, and inputs (inc. hidden)
   dump-storage [url]            Dump localStorage, sessionStorage, and cookies (a URL navigates
                                 there first; omit it to read the tab as it is)
@@ -270,31 +269,6 @@ async function release(client) {
 /** @param {Ctx} ctx */
 async function cmdStart({ port }) {
   await startChrome({ port });
-}
-
-/** @param {Ctx} ctx */
-async function cmdMarkdown({ args, port }) {
-  // `markdown <url> [destFile]` or, for the live tab, `markdown [destFile]`
-  const first = args[1] && !args[1].startsWith('--') ? args[1] : null;
-  const url = first && isHttpUrl(first) ? first : null;
-  const destFile = url ? (args[2] && !args[2].startsWith('--') ? args[2] : null) : first;
-
-  const client = (activeClient = await attach(port));
-  if (url) await client.goto(url);
-  const article = await client.toMarkdown();
-
-  if (!article) {
-    throw new Error('No readable article content found.');
-  }
-
-  if (destFile) {
-    await fs.promises.writeFile(path.resolve(destFile), article.markdown, 'utf8');
-    console.log(`Saved Markdown to: ${path.resolve(destFile)}`);
-  } else {
-    console.log(article.markdown);
-  }
-
-  await release(client);
 }
 
 /** @param {Ctx} ctx */
@@ -1292,8 +1266,6 @@ async function main() {
 
   switch (command) {
     case 'start': await cmdStart(ctx); break;
-
-    case 'markdown': await cmdMarkdown(ctx); break;
 
     case 'dump-forms': await cmdDumpForms(ctx); break;
 

@@ -259,17 +259,6 @@ class ChromeClient {
   }
 
   /**
-   * @param {object} [options]
-   */
-  async toMarkdown(options) {
-    return this.dom.toMarkdown(options);
-  }
-
-  async toCheerio() {
-    return this.dom.toCheerio();
-  }
-
-  /**
    * @returns {Promise<void>}
    */
   async closePage() {
