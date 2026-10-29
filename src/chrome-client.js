@@ -98,8 +98,9 @@ class ChromeClient {
       // browser.pages() initializes every page, and initializing a page sends Network.enable, which a
       // blocked renderer never answers: one wedged tab would make every command fail. Listing targets
       // only reads target info, so initialize the one tab that was asked for, and only for a budget.
+      // Target[] is synchronous in puppeteer-core: awaiting it added nothing (javascript:S4123).
       /** @type {import('puppeteer-core').Target[]} */
-      const allTargets = await browser.targets();
+      const allTargets = browser.targets();
       const targets = allTargets.filter((target) => target.type() === 'page');
       const tab = options.tab ?? 0;
       if (tab >= targets.length) throw new Error(`Tab ${tab} does not exist: Chrome has ${targets.length} tab(s). List them with: node cli.js tabs`);
