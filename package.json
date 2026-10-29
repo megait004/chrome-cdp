@@ -10,7 +10,8 @@
 		"start": "node cdp.js",
 		"typecheck": "tsc -p jsconfig.json",
 		"typecheck:strict": "tsc -p jsconfig.json --strict --noImplicitAny",
-		"clean": "node cli.js clean"
+		"clean": "node cli.js clean",
+		"test": "node --test"
 	},
 	"keywords": [
 		"chrome",
@@ -35,8 +36,6 @@
 	"dependencies": {
 		"@ast-grep/napi": "0.51.0",
 		"puppeteer-core": "25.14.0",
-		"puppeteer-extra": "3.3.6",
-		"puppeteer-extra-plugin-stealth": "2.11.2",
 		"webcrack": "2.16.0"
 	},
 	"allowScripts": {

@@ -1,10 +1,8 @@
 'use strict';
 
-// .default is the same object as the module (runtime-identical); the bare require loses its typings under NodeNext
-const puppeteer = require('puppeteer-extra').default;
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteer = require('puppeteer-core');
 const { PROTOCOL_TIMEOUT_MS, GOTO_TIMEOUT_MS, UNRESPONSIVE_WAIT_MS, CLEANUP_WAIT_MS } = require('./timeouts');
-const { settleWithin, sleep } = require('./util');
+const { settleWithin } = require('./util');
 
 const DOMController = require('./dom-controller');
 const NetworkController = require('./network-controller');
@@ -15,8 +13,6 @@ const WorkerController = require('./worker-controller');
 const DebugController = require('./debug-controller');
 const PerformanceController = require('./performance-controller');
 const VisualController = require('./visual-controller');
-
-puppeteer.use(StealthPlugin());
 
 /**
  * @typedef {{ dom: InstanceType<typeof DOMController>, network: InstanceType<typeof NetworkController>, websocket: InstanceType<typeof WebSocketController>, console: InstanceType<typeof ConsoleController>, sources: InstanceType<typeof SourceController>, debug: InstanceType<typeof DebugController>, performance: InstanceType<typeof PerformanceController>, visual: InstanceType<typeof VisualController> }} Controllers
@@ -107,10 +103,17 @@ class ChromeClient {
       const targets = allTargets.filter((target) => target.type() === 'page');
       const tab = options.tab ?? 0;
       if (tab >= targets.length) throw new Error(`Tab ${tab} does not exist: Chrome has ${targets.length} tab(s). List them with: node cli.js tabs`);
+      // The losing branch of a race keeps its timer alive, which holds the process open for the full
+      // budget after the page already answered (measured: +3 s on every command). Clear it.
+      /** @type {ReturnType<typeof setTimeout> | undefined} */
+      let budget;
       const page = await Promise.race([
         targets[tab].page().catch(() => null),
-        sleep(UNRESPONSIVE_WAIT_MS).then(() => null),
+        new Promise((resolve) => {
+          budget = setTimeout(() => resolve(null), UNRESPONSIVE_WAIT_MS);
+        }),
       ]);
+      clearTimeout(budget);
       if (!page) {
         // note: ceiling — close and goto cannot run on a busy-loop tab, because puppeteer needs a page
         // handle and page setup itself needs the renderer. Upgrade path if this bites again: close via
@@ -136,7 +139,6 @@ class ChromeClient {
             client.network.startRecording(),
             client.websocket.startRecording(),
             client.console.startRecording(),
-            client.sources.enable(),
           ]),
           UNRESPONSIVE_WAIT_MS,
           'enabling the recording domains (traffic, events, console, script search will be empty)'
@@ -166,7 +168,6 @@ class ChromeClient {
           client.network.startRecording(),
           client.websocket.startRecording(),
           client.console.startRecording(),
-          client.sources.enable(),
         ]),
         UNRESPONSIVE_WAIT_MS,
         'enabling the recording domains (traffic, events, console, script search will be empty)'
