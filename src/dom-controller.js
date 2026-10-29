@@ -78,26 +78,45 @@ class DOMController {
     if (!page) throw new TypeError('Page instance is required for DOMController');
     this._page = page;
     this._cdp = cdpSession;
+    this._focusEmulated = false;
   }
 
   /**
-   * Brings the window back to visible before keyboard input. A hidden window drops synthesized keys without an error;
-   * a minimize-then-restore forces the real activation.
+   * A hidden or unfocused page drops synthesized input. Two ways out, cheapest first:
+   * 1. focus emulation (`Emulation.setFocusEmulationEnabled`) — the page reports visible + focused while the
+   *    user's window stays exactly where it is; this is the default because it never steals the foreground;
+   * 2. minimize then restore — the only revival for a Chromium build that ignores (1); visible to the user,
+   *    so it is the fallback.
    * @returns {Promise<void>}
    */
   async ensureVisible() {
-    let vis;
-    try {
-      vis = await this._page.evaluate(() => document.visibilityState);
-    } catch { return; } // detached context — nothing to revive
-    if (vis === 'visible' || !this._cdp) return;
-    // Poll for the state we asked for instead of fixed sleeps: returns as soon as
+    if (!this._cdp) return;
+    /** @returns {Promise<{ visible: boolean, focused: boolean } | null>} */
+    const read = () => this._page.evaluate(() => ({ visible: document.visibilityState === 'visible', focused: document.hasFocus() })).catch(() => null);
+    const state = await read();
+    if (!state) return; // detached context — nothing to revive
+    if (state.visible && state.focused) return;
+
+    // 1) focus emulation: no window flash, no stolen focus
+    if (!this._focusEmulated) {
+      try {
+        await this._cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+        this._focusEmulated = true;
+      } catch {} // older Chromium without the command keeps the fallback
+    }
+    if (this._focusEmulated) {
+      const after = await read();
+      if (after && after.visible && after.focused) return;
+    }
+    if (state.visible) return; // only focus was missing; raising the window would not add visibility
+
+    // 2) Poll for the state we asked for instead of fixed sleeps: returns as soon as
     // Chromium has applied the bounds change, and gives up after `ms` (best effort).
     const awaitState = async (/** @type {string} */ want, /** @type {number} */ ms) => {
       const end = Date.now() + ms;
       while (Date.now() < end) {
-        const state = await this._page.evaluate(() => document.visibilityState).catch(() => null); // NOSONAR S9382
-        if (state === want) return;
+        const current = await this._page.evaluate(() => document.visibilityState).catch(() => null); // NOSONAR S9382
+        if (current === want) return;
         await new Promise((r) => setTimeout(r, 50)); // NOSONAR S9382
       }
     };
