@@ -12,6 +12,9 @@ const T = require('./src/timeouts');
 const { spawn } = require('node:child_process');
 const { recordSite, createRun, activeRun, indexSite } = require('./src/site-mirror');
 const { messageOf, settleWithin } = require('./src/util');
+const { expandEquals, isHttpUrl, parseGlobalOptions, takeFlag } = require('./src/cli/args');
+const { HELP_TEXT } = require('./src/cli/help');
+const { emit, interactiveHints, printTraffic, redactEntry, redactHeaders, redactRawText, slimEntry, slimSocket } = require('./src/cli/output');
 
 let tabIndex = 0; // set from --tab; every command attaches to this tab
 
@@ -43,15 +46,6 @@ const EVAL_PROTOCOL_TIMEOUT_MS = 10000;
 /** @type {Client | undefined} */
 let activeClient;
 
-/** @param {unknown} s */
-/**
- * A navigable URL: http(s), but also data: and file: for synthetic test pages.
- * @param {unknown} s @returns {boolean}
- */
-function isHttpUrl(s) {
-  return typeof s === 'string' && /^(https?|data|file):/i.test(s);
-}
-
 const SLOW = Symbol('slow');
 
 /**
@@ -74,247 +68,6 @@ async function untilNotPaused(work) {
   const held = core().DebugController.readPauseMarker();
   if (held) throw new Error(`The page is paused in the debugger at ${held.url || held.scriptId}:${held.line} (${held.reason}), held by pid ${held.pid}. Resume it with: node cli.js resume`);
   return work;
-}
-
-const HELP_TEXT = `
-Usage: node cli.js <command> [options] [arguments]
-
-Commands:
-  start                         Start Chrome with remote debugging on port 9222
-  dump-forms [url]              Audit all forms, methods, actions, and inputs (inc. hidden)
-  dump-storage [url]            Dump localStorage, sessionStorage, and cookies (a URL navigates
-                                there first; omit it to read the tab as it is)
-  listeners [url] [selector]    Audit event listeners on target selector or 'window'
-  search-sources [url] <query>  Search across all loaded script bundles. Plain query =
-                                case-insensitive substring; use --re for regex
-  download-bundle [url] <queryOrId> <destFile>
-                                Download matching script bundle to local file
-  deobfuscate [url] <queryOrId> [destFile]
-                                Deobfuscate & unminify script using webcrack
-  unpack [url] <queryOrId> <destDir>
-                                Unpack Webpack/Browserify modules into folder
-  ast-search [url] <queryOrId> <pattern>
-                                Structural AST search using ast-grep (e.g. 'fetch($U, $$$)')
-  vm-scripts [url]              List scripts with no URL (created by eval/Function):
-                                scriptId, start line, line count, and the first 100 characters
-  find-function [url] <queryOrId> <name>
-                                Lines where a function is defined ("function NAME(" or "NAME = function"),
-                                with the column of the definition; each line cut to 300 characters
-  snippet [url] <queryOrId> <line> [--col N] [--before N] [--after N]
-                                Read a window of a script's source around a position, marking the column
-                                with >>>. Use it after find-function or catch-script: a minified script is one
-                                huge line, so a position in it can only be read as a window
-  layout [url] [--wait S]       Record style, layout, pre-paint and paint for S seconds (default 5; interact
-                                meanwhile) and report totals and the script location that caused each stage
-  events [url]                  Every event listener registered on the window and the document tree
-                                (and iframes), grouped by event type and handler location
-  catch-script [url] [--min-bytes N] [--max-bytes N] [--only-runtime] [--break-line N] [--break-col N]
-                                [--eval <expr>] [--frame N] [--timeout S]
-                                Pause before a script runs, report the script and the stack, then (with
-                                --break-line) stop inside that script, list the variables of the frame and of
-                                its caller, and run --eval (--frame picks the frame, default 0). Reaches code
-                                with no URL that the break command cannot name. Narrows the target with
-                                --min-bytes/--max-bytes (script characters) and --only-runtime (scripts with
-                                no URL, which skips inline HTML blocks)
-  profile [url] [--wait S]      CPU profile for S seconds (default 5; interact meanwhile): functions by
-                                self time, with the two callers that called them most
-  mirror start <url> [outDir]   Load the URL with the cache off and start recording in the
-                                background: every request and response (raw headers, cookies
-                                included), WebSocket frames, and bodies, until you stop it.
-                                Lazy loads and API calls after your interaction are kept.
-                                Writes outDir/<host>/<timestamp>/ (default .tmp/mirror)
-  mirror stop [outDir]          Stop the active recording; writes cookies.json, storage.json,
-                                rendered.html and manifest.json. LATEST names the newest run
-  index-site <stampDir>         Unpack every JS file of a mirror run with webcrack
-                                into <stampDir>/unpacked
-  traffic [url] [--bodies] [--wait S] [--headers] [--full] [--no-redact]
-                                Record network + WebSocket frames. With a URL: navigate,
-                                wait for network idle, then for the first WS frame.
-                                Without: attach to the live tab and record --wait S
-                                (default 5) while the user interacts. --bodies drains
-                                each response body into the result
-  eval [url] <expression> [--frame U] [--file script.js]   (--file: read the expression from a file)
-  console [url] [--level error|warning|info|debug] [--filter text] [--limit N] [--wait S]
-                                Console messages and uncaught exceptions from this
-                                invocation (a URL navigates first; otherwise listen --wait S)
-  raw [url] <id|url-part> [--response] [--wait S] [--no-redact]
-                                Raw HTTP request (or --response) with unnormalized headers,
-                                ready to paste into Burp Repeater
-  search-bodies [url] <text|/regex/> [--wait S]
-                                Search recorded response bodies (native search + fallback)
-  ws-frames [url] [--direction sent|received] [--query text] [--hex] [--limit N] [--wait S]
-                                WebSocket frames; --hex decodes binary frames
-  globals [--frame U] [--filter text] [--limit N]
-                                Global names on window (state, engines, tokens), with type/ctor
-  objects <SomeClass.prototype> [--limit N]
-                                Live instances of a class in the V8 heap
-  doctor                        Diagnose node, Chrome, tab, page, debugger and mirror state
-                                Evaluate JavaScript in the page. Passing a URL navigates
-                                first; without one it evaluates on the current tab.
-                                --frame U runs it inside the iframe whose URL contains U
-  break [url] <scriptQuery> <line>
-                                Set a Debugger breakpoint (URL substring match) and wait
-                                for the hit. Line is SCRIPT-relative and 0-based: line N
-                                of the source as shown by search-sources/getScriptSource
-                                (inline <script> blocks are auto-offset). Flags:
-                                --col N, --condition <expr>, --eval <expr> (runs on the
-                                top call frame), --timeout S (default 15), --hold
-                                (ignored: Chrome resumes when the command exits),
-                                --exceptions (also pause on exceptions),
-                                --trigger <js> (run this JavaScript after arming, in the same
-                                session: the action that loads the script goes here)
-  goto <url>                    Navigate the tab to a URL and report the final url and title
-  resume                        Resume the page if it is paused in the debugger (for example
-                                after a breakpoint was left armed by another command)
-  close                         Close the current tab (tabs are otherwise left open —
-                                you close them by hand)
-
-Interaction loop — operate the live tab one step at a time, like a person:
-  snapshot [url] [selector]     List interactive elements currently visible (buttons,
-                                links, inputs...). READ THIS before every action
-  click [url] <sel|text=Text>   Click, then report what changed (url, added/removed
-                                elements). selector looks like CSS; text=Click Me
-                                matches by visible text instead
-  type [url] <sel> <text>       Keystroke-by-keystroke into an input, reports the value
-  fill [url] <sel> <value>      Set an input value directly (fires input/change)
-  press [url] <key>             Press a key on the focused element (Enter, Tab, Escape)
-  tabs                          List open tabs (index, url, title). Every command uses
-                                tab 0 unless --tab N selects another one
-  frames                        List child iframes: index, canvas count, element count, url.
-                                --frame takes a substring of the url or this index
-  status                        Is Chrome reachable on --port, and is a mirror recording running?
-  step [url] <query> <line> [--trigger "<js>"] [--into|--out] [--times N] [--eval expr]
-                                Pause once, then step N times, reporting each stop with its
-                                frames. Step across calls is impossible (each call is its own
-                                CDP session), so the breakpoint and trigger live here
-  step --pause [--times N]      Pause whatever is running now, then step
-  postmessage [url] [--wait S]  Record window.postMessage traffic (the hook applies to
-                                documents created after it, so pass a URL)
-  replay [url] <id|url-part>    Re-send a recorded XHR/fetch with Chrome's own replayXHR
-  search-traffic [url] <text|/re/>
-                                Find a recorded request by url, body or headers
-  ws-search [url] <text|/re/> [--direction sent|received]
-                                Find recorded WebSocket frames by payload
-  inspect [url] <expression>    Deep property dump (cycles, DOM nodes, functions)
-  workers                       Dedicated/service/shared workers and their URLs
-  purge --cache --cookies       Delete the browser cache and/or the profile's cookies
-  mirror-run <url> <runDir>     Record a page into a mirror run directory (internal: used by
-                                mirror's worker; records every request, response and lazy load)
-  clean                         Delete the scratch folder .tmp/ inside the skill (this also deletes
-                                mirror runs and anything else under .tmp/; copy what you need first)
-  click-at <x> <y> [--frame U] [--canvas] [--index N] [--button left|right|middle]
-                                Mouse click at a coordinate. With --frame, x/y are relative
-                                to that iframe; --canvas adds the canvas offset and converts
-                                bitmap pixels to CSS pixels (a scaled canvas is handled).
-                                --settle waits for network idle first (only after a load)
-  drag <x1> <y1> <x2> <y2> [--frame U] [--canvas] [--index N] [--button left|right|middle] [--steps N]
-                                Press, move in steps, release: aiming, sliders, map pans.
-                                --canvas converts bitmap pixels like click-at
-  wheel <dx> <dy> [--frame U] [--canvas] [--index N] [--x N --y N]
-                                Real mouse wheel at the frame centre (or the canvas centre
-                                with --canvas) unless x/y are given
-  key <code...> [--hold MS]     Hold one key or a chord (KeyW+ShiftLeft) on the focused
-                                element. Click the game first so its frame has focus
-  canvas [--list] [--frame U] [--index N] [--out F.png] [--screen] [--record S --fps N] [--preserve]
-                                --list every canvas (index, bitmap, css, visible). Without
-                                --index the largest visible canvas is used, which is the game
-                                one when ads draw their own. --out saves the pixels,
-                                --screen the composited pixels (WebGL, no reload),
-                                --record S --out <dir> a PNG sequence
-  wait [url] <selector> [--timeout S]
-                                Wait for a selector to appear (default 5s)
-
-Tabs are never closed automatically: every command attaches to the live tab (re-
-navigating only when you pass a URL) and leaves it open on exit, so page state —
-logins, SPA routes, WebSocket sessions — survives between commands.
-
-Options:
-  --port <number>               CDP port (default: 9222)
-  --json                        Format output as structured JSON (traffic default: table)
-  --out <file>                  Write the JSON result to a file instead of stdout;
-                                prints the path plus a short summary (every command
-                                that produces structured output)
-  --help                        Display this help message
-  --version                     Print the version
-`;
-
-/**
- * Splits global options out of argv so they never land in a positional slot, so `eval <expr> --port 9333`
- * evaluates only the expression.
- * @param {string[]} argv
- * @returns {{ positional: string[], port: number, isJson: boolean, out: string|null, tab: number }}
- */
-function parseGlobalOptions(argv) {
-  const positional = [];
-  let port = 9222;
-  let isJson = false;
-  let out = null;
-  let tab = 0;
-
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--port') {
-      port = Number(argv[++i]);
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        throw new Error('Port must be an integer between 1 and 65535');
-      }
-    } else if (argv[i] === '--json') {
-      isJson = true;
-    } else if (argv[i] === '--tab') {
-      tab = Number(argv[++i]);
-      if (!Number.isInteger(tab) || tab < 0) throw new Error('--tab expects a tab index from 0, e.g. --tab 1 (see: node cli.js tabs)');
-    } else if (argv[i] === '--out') {
-      out = argv[++i] || null;
-      if (!out) throw new Error('--out requires a file path: --out result.json');
-    } else {
-      positional.push(argv[i]);
-    }
-  }
-
-  return { positional, port, isJson, out, tab };
-}
-
-/** Above this size a reply is written to a file instead of stdout, so it cannot flood an agent's context. */
-const MAX_INLINE_BYTES = 60_000;
-
-/**
- * Writes the JSON result to stdout, or to `--out <file>`. A file keeps large output out of the agent's context.
- * @param {object} result JSON-serializable command result
- * @param {string|null} outFile `--out` value
- */
-async function emit(result, outFile) {
-  const json = JSON.stringify(result, null, 2);
-  if (outFile) {
-    const abs = path.resolve(outFile);
-    fs.mkdirSync(path.dirname(abs), { recursive: true }); // agents forget to mkdir
-    await fs.promises.writeFile(abs, json, 'utf8');
-    console.log(`Saved ${Buffer.byteLength(json)} bytes of JSON to: ${abs}`);
-    return;
-  }
-  if (Buffer.byteLength(json) > MAX_INLINE_BYTES) {
-    // A reply this large costs more context than the answer is worth. File it and say where.
-    const dir = path.join(__dirname, '.tmp', 'results');
-    fs.mkdirSync(dir, { recursive: true });
-    const abs = path.join(dir, `result-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
-    await fs.promises.writeFile(abs, json, 'utf8');
-    const keys = result && typeof result === 'object' ? Object.keys(result).slice(0, 10) : [];
-    console.log(JSON.stringify({ savedTo: abs, bytes: Buffer.byteLength(json), keys, note: 'Reply was over 60 KB, so it went to a file. Read it, or pass --out <file> to choose the path.' }, null, 2));
-    return;
-  }
-  console.log(json);
-}
-
-/**
- * Short `tag#id "text"` lines for error hints, shared by the click and wait failure paths.
- * @param {import('./src/types/snapshot').SnapshotElement[]} elements result of interactiveSnapshot()
- * @param {{ limit?: number, skipDisabled?: boolean }} [options]
- * @returns {string[]}
- */
-function interactiveHints(elements, { limit = 8, skipDisabled = false } = {}) {
-  return elements
-    .filter((e) => !skipDisabled || !e.disabled)
-    .slice(0, limit)
-    // name is shown as an attribute selector when there is no id, so the hint can be used as a selector.
-    .map((e) => `${e.tag}${e.id ? '#' + e.id : e.name ? '[name="' + e.name + '"]' : ''}${e.text ? ' "' + e.text.slice(0, 30) + '"' : ''}`);
 }
 
 /**
@@ -549,106 +302,6 @@ async function withBodies(client, httpTraffic) {
       await client.network.getResponseBody(t.id).catch((/** @type {unknown} */ err) => `(${messageOf(err).slice(0, 80)})`));
     return { ...t, body, ...(parsedJson ? { parsedJson } : {}) };
   }));
-}
-
-/**
- * @param {Array<import('./src/network-controller').TrafficEntry>} httpTraffic
- * @param {import('./src/types/websocket').WsSocket[]} wsSockets
- * @param {string} finalUrl
- * @param {boolean} showHeaders
- */
-function printTraffic(httpTraffic, wsSockets, finalUrl, showHeaders) {
-  console.log(`\n=== HTTP Requests (${httpTraffic.length}) === (final URL: ${finalUrl})`);
-  httpTraffic.forEach((t) => {
-    console.log(`[${t.method || 'GET'}] ${t.status || '...'} ${t.url} (${t.resourceType})`);
-    if (showHeaders) {
-      for (const [name, value] of Object.entries(t.headers || {})) console.log(`    > ${name}: ${value}`);
-      // A header sent twice (Set-Cookie) is joined with newlines by CDP: print each value on its own line, with the name.
-      for (const [name, value] of Object.entries(t.rawResponseHeaders || t.responseHeaders || {})) {
-        for (const line of String(value).split('\n')) console.log(`    < ${name}: ${line}`);
-      }
-    }
-  });
-
-  console.log(`\n=== WebSocket Connections (${wsSockets.length}) ===`);
-  wsSockets.forEach((s) => {
-    console.log(`[WS] ${s.url} - State: ${s.state}, Frames: ${s.frames.length}`);
-  });
-}
-
-/** Headers whose value is a credential. Redacted when a reply is printed to stdout, kept in --out files. */
-const SECRET_HEADERS = /^(cookie|set-cookie|authorization|proxy-authorization|x-api-key|api-key|x-auth-token)$/i;
-
-/**
- * @template {Record<string, string> | null} T
- * @param {T} headers
- * @returns {T}
- */
-function redactHeaders(headers) {
-  if (!headers) return headers;
-  /** @type {Record<string, string>} */
-  const out = {};
-  for (const [name, value] of Object.entries(headers)) out[name] = SECRET_HEADERS.test(name) ? '[REDACTED]' : value;
-  return /** @type {T} */ (out);
-}
-
-/** @param {string} text */
-function redactRawText(text) {
-  return text.replace(/^(cookie|set-cookie|authorization|proxy-authorization|x-api-key|api-key|x-auth-token):[^\r\n]*/gim, '$1: [REDACTED]');
-}
-
-/** @param {import('./src/network-controller').TrafficEntry} entry */
-function redactEntry(entry) {
-  const copy = { ...entry };
-  copy.headers = redactHeaders(entry.headers);
-  copy.rawHeaders = redactHeaders(entry.rawHeaders);
-  copy.responseHeaders = redactHeaders(entry.responseHeaders);
-  copy.rawResponseHeaders = redactHeaders(entry.rawResponseHeaders);
-  if (typeof entry.rawResponseHeadersText === 'string')
-    copy.rawResponseHeadersText = entry.rawResponseHeadersText.replace(/^(cookie|set-cookie|authorization|proxy-authorization|x-api-key|api-key):[^\r\n]*/gim, '$1: [REDACTED]');
-  return copy;
-}
-
-/**
- * The fields a reader needs to find a request and decide what to read next. The raw header maps,
- * initiator and cookie bookkeeping are what make a full capture megabytes for a page like deadshot.io.
- * @param {import('./src/network-controller').TrafficEntry & { body?: unknown, parsedJson?: unknown }} entry
- * @param {boolean} redact
- */
-function slimEntry(entry, redact) {
-  return {
-    id: entry.id,
-    url: entry.url,
-    method: entry.method,
-    status: entry.status,
-    statusText: entry.statusText,
-    resourceType: entry.resourceType,
-    mimeType: entry.mimeType,
-    protocol: entry.protocol,
-    startTime: entry.startTime,
-    durationMs: entry.durationMs,
-    encodedDataLength: entry.encodedDataLength,
-    failed: entry.failed || undefined,
-    errorText: entry.errorText || undefined,
-    redirectIndex: entry.redirectIndex || undefined,
-    redirectedFrom: entry.redirectedFrom || undefined,
-    redirectedTo: entry.redirectedTo || undefined,
-    postData: entry.postData || undefined,
-    headers: redact ? redactHeaders(entry.headers) : entry.headers,
-    ...('body' in entry ? { body: entry.body } : {}),
-    ...('parsedJson' in entry ? { parsedJson: entry.parsedJson } : {}),
-  };
-}
-
-/** @param {import('./src/types/websocket').WsSocket} socket @param {boolean} redact */
-function slimSocket(socket, redact) {
-  return {
-    url: socket.url,
-    state: socket.state,
-    frames: socket.frames.length,
-    handshakeRequest: socket.handshakeRequest ? { headers: redact ? redactHeaders(socket.handshakeRequest.headers) : socket.handshakeRequest.headers } : null,
-    handshakeResponse: socket.handshakeResponse ? { status: socket.handshakeResponse.status, headers: redact ? redactHeaders(socket.handshakeResponse.headers) : socket.handshakeResponse.headers } : null,
-  };
 }
 
 /** @param {Ctx} ctx */
@@ -941,17 +594,6 @@ async function cmdSnapshot({ args, port, outFile }) {
   if (!snap) throw new Error(`No element matches scope selector: ${selector}`);
   await emit({ url: snap.url, readyState: snap.readyState, count: snap.count, elements: snap.elements, frames: await frameSnapshots(client) }, outFile);
   await release(client);
-}
-
-// Canvas and raw input: games draw on <canvas> inside iframes, so there are no selectors.
-// Use `snapshot` for each frame's URL and canvas index, then act by coordinates.
-/** @param {string[]} args @param {string} name @returns {string | null} */
-function takeFlag(args, name) {
-  const i = args.indexOf(name);
-  if (i === -1) return null;
-  const [, value] = args.splice(i, 2);
-  if (value === undefined) throw new Error(`${name} needs a value`);
-  return value;
 }
 
 /** @param {Ctx} ctx */
@@ -1963,17 +1605,6 @@ function recordStep(step) {
   const file = path.join(__dirname, '.tmp', 'steps.jsonl');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, `${JSON.stringify(step)}\n`);
-}
-
-/**
- * `--flag=value` -> `--flag value`, so both spellings parse the same.
- * @param {string[]} argv @returns {string[]}
- */
-function expandEquals(argv) {
-  return argv.flatMap((/** @type {string} */ arg) => {
-    const m = /^--([a-z0-9-]+)=([\s\S]*)$/i.exec(arg);
-    return m ? [`--${m[1]}`, m[2]] : [arg];
-  });
 }
 
 /**
