@@ -103,8 +103,6 @@ node cli.js index-site .tmp/mirror/example.com/<stamp>
 
 Then navigate the unpacked code with `srcwalk discover <symbol>` and `srcwalk trace callers <fn>` (scope it to the `unpacked` folder).
 
-**Article text:** `node cli.js markdown <url> out.md`. The DOM-level version is `client.toMarkdown()`.
-
 - `LATEST` names the newest run. `manifest.json` lists every file with its sha256.
 - The recorder keeps running until `mirror stop`. It does not crawl; you drive the interaction.
 - `cookies.json` and `storage.json` hold live session tokens. Do not share or commit them.

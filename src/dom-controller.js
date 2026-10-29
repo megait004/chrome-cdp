@@ -1,11 +1,6 @@
 'use strict';
 
-const cheerio = require('cheerio');
 const { WINDOW_HIDE_WAIT_MS, WINDOW_SHOW_WAIT_MS } = require('./timeouts');
-const { JSDOM } = require('jsdom');
-const { Readability } = require('@mozilla/readability');
-const TurndownService = require('turndown');
-const { gfm } = require('turndown-plugin-gfm');
 
 /** @typedef {import('./types/snapshot').SnapshotElement} SnapshotElement */
 /** @typedef {import('./types/snapshot').InteractiveSnapshot} InteractiveSnapshot */
@@ -623,55 +618,6 @@ class DOMController {
     return this._page.evaluate(() => /** @type {HookedWindow} */ (/** @type {unknown} */ (window)).__postMessageLogs || []);
   }
 
-  /**
-   * @returns {Promise<import('cheerio').CheerioAPI>}
-   */
-  async toCheerio() {
-    const html = await this.getHtml();
-    return cheerio.load(html);
-  }
-
-  /**
-   * @param {{ headingStyle?: 'setext' | 'atx', codeBlockStyle?: 'indented' | 'fenced' }} [options]
-   * @returns {Promise<{ title: string, byline?: string, excerpt?: string, markdown: string, textContent: string } | null>}
-   */
-  async toMarkdown(options = {}) {
-    const html = await this.getHtml();
-    const url = this._page.url();
-
-    const dom = new JSDOM(html, { url });
-    let article;
-    try {
-      article = new Readability(dom.window.document, { keepClasses: false }).parse();
-    } finally {
-      dom.window.close();
-    }
-
-    if (!article?.content) {
-      return null;
-    }
-
-    const turndown = new TurndownService({
-      headingStyle: options.headingStyle || 'atx',
-      codeBlockStyle: options.codeBlockStyle || 'fenced',
-      hr: '---',
-      bulletListMarker: '-',
-    });
-    turndown.use(gfm);
-
-    const markdownBody = turndown.turndown(article.content);
-    const fullMarkdown = article.title
-      ? `# ${article.title}\n\n${markdownBody}`
-      : markdownBody;
-
-    return {
-      title: article.title || '',
-      byline: article.byline || '',
-      excerpt: article.excerpt || '',
-      textContent: article.textContent || '',
-      markdown: fullMarkdown,
-    };
-  }
 }
 
 module.exports = DOMController;

@@ -84,8 +84,6 @@ Also exported: `startChrome({ port })`, `findChromePath()`, `checkCdpReady(port)
 | `setViewport({ width, height, deviceScaleFactor, isMobile })` | — | Only when you need a specific viewport; an unconditional override puts the tab under Emulation, which can stop background frame production |
 | `title()` / `content()` / `url()` | `string` | Rendered title / full HTML / current URL (sync). `url()` is the truth after redirects — not the URL you passed to `goto()` |
 | `evaluate(expressionOrFn, ...args)` | value | Runs in page context |
-| `toMarkdown(options)` | `{ title, markdown, ... }` | Readability + Turndown GFM |
-| `toCheerio()` | CheerioAPI | Rendered DOM, not the raw served HTML |
 | `closePage()` | — | Closes this tab |
 | `disconnect()` | — | Detaches, leaves Chrome running |
 | `closeBrowser()` | — | Kills Chrome entirely |
@@ -124,7 +122,6 @@ Pair `closePage()` + `disconnect()` in a `finally`.
 | `dumpStorage()` | `{ localStorage, sessionStorage }` |
 | `hookPostMessage()` | Installs a `postMessage` + message-listener recorder. **Must be called before `goto()`** — it uses `evaluateOnNewDocument` and only affects subsequent loads |
 | `getPostMessageLogs()` | `{ direction, origin/targetOrigin, data, timestamp }[]` |
-| `toCheerio()` / `toMarkdown(options)` | Same as the page-level versions |
 
 ---
 
@@ -268,7 +265,6 @@ For canvas games and iframes. Games draw on `<canvas>` inside an iframe, so the 
 | --- | --- |
 | `start` | Launch Chrome with remote debugging |
 | `close` | Close the current tab; falls back to `about:blank` when it is the last tab so Chrome stays up. Not possible on a tab whose renderer is blocked by a synchronous call (`status` reports it as not answering): close that tab in Chrome's UI or restart Chrome |
-| `markdown [url] [destFile]` | Clean article text as GFM |
 | `dump-forms [url]` | Forms + hidden inputs as JSON |
 | `dump-storage [url]` | localStorage, sessionStorage, cookies |
 | `listeners [url] [selector]` | Defaults to `window` |
